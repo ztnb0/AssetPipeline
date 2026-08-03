@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.next/
+coverage/
+*.log
+test-data/
+
+# Local demo media; production assets are stored in MinIO volumes.
+/studio-remotion.mp4
