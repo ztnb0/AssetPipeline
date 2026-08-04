@@ -1,10 +1,26 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api";
 
 type Status = "processing" | "ready" | "failed";
+type UploadStatus = "queued" | "uploading" | "processing" | "ready" | "failed";
+type UploadItem = {
+  id: string;
+  file: File;
+  status: UploadStatus;
+  progress: number;
+  assetId?: string;
+  error?: string;
+};
+
+type DroppedEntry = {
+  isFile: boolean;
+  isDirectory: boolean;
+  file?: (callback: (file: File) => void) => void;
+  createReader?: () => { readEntries: (callback: (entries: DroppedEntry[]) => void) => void };
+};
 type Asset = {
   id: string;
   original_name: string;
@@ -22,10 +38,33 @@ type Asset = {
   category: string | null;
   categories: string[];
   error_message: string | null;
+  source_type: string;
+  source_id: string | null;
+  source_page_url: string | null;
+  source_author: string | null;
+  source_license: string | null;
   created_at: string;
   content_url: string;
   thumbnail_url: string | null;
 };
+
+type ExternalProvider = "pexels" | "pixabay" | "unsplash" | "openverse";
+type ExternalAsset = {
+  provider: ExternalProvider;
+  external_id: string;
+  media_type: "image" | "video";
+  title: string;
+  preview_url: string;
+  author: string;
+  source_page_url: string;
+  width: number | null;
+  height: number | null;
+  duration: number | null;
+  license: string | null;
+  license_url: string | null;
+};
+
+type FredSeries = { id: string; label: string; short: string; category: string };
 
 const statusText: Record<Status, string> = {
   processing: "AI 分析中",
@@ -33,9 +72,24 @@ const statusText: Record<Status, string> = {
   failed: "处理失败",
 };
 
+const uploadStatusText: Record<UploadStatus, string> = {
+  queued: "等待上传",
+  uploading: "上传中",
+  processing: "AI 分析中",
+  ready: "完成",
+  failed: "失败",
+};
+
 function absoluteUrl(path: string | null) {
   if (!path) return "";
   return `${API.replace(/\/api$/, "")}${path}`;
+}
+
+function createUploadId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `upload-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function durationText(seconds: number | null) {
@@ -45,13 +99,15 @@ function durationText(seconds: number | null) {
 }
 
 const mediaText: Record<string, string> = { image: "图片", video: "视频", audio: "音频" };
-const categoryOptions = ["科技", "财经", "民生", "教育", "商业", "文化", "娱乐", "体育", "医疗", "自然", "交通", "工业", "政务", "音频制作", "待内容识别", "其他"];
+const providerText: Record<ExternalProvider, string> = { pexels: "Pexels", pixabay: "Pixabay", unsplash: "Unsplash", openverse: "Openverse" };
+const categoryOptions = ["科技", "财经", "金融市场", "宏观经济", "金融理财", "投资管理", "保险规划", "养老规划", "税务规划", "财富传承", "私人银行", "金融教育", "财经新闻", "民生", "教育", "商业", "文化", "娱乐", "体育", "医疗", "自然", "交通", "工业", "政务", "音频制作", "待内容识别", "其他"];
 
 export default function Home() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
+  const [uploadItems, setUploadItems] = useState<UploadItem[]>([]);
+  const [uploadConcurrency, setUploadConcurrency] = useState<1 | 3 | 5>(3);
   const [message, setMessage] = useState("");
   const [queryTerms, setQueryTerms] = useState<string[]>([]);
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
@@ -59,7 +115,10 @@ export default function Home() {
   const [deleting, setDeleting] = useState(false);
   const [typeFilter, setTypeFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
+  const [externalOpen, setExternalOpen] = useState(false);
+  const [fredOpen, setFredOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const activeUploads = useRef(new Map<string, XMLHttpRequest | null>());
 
   const loadAssets = useCallback(async (q = "") => {
     try {
@@ -68,6 +127,12 @@ export default function Home() {
       const data = await response.json();
       setAssets(data.items);
       setQueryTerms(data.query_terms ?? []);
+      setUploadItems((items) => items.map((item) => {
+        if (!item.assetId || (item.status !== "processing" && item.status !== "ready")) return item;
+        const asset = data.items.find((candidate: Asset) => candidate.id === item.assetId);
+        if (!asset || asset.status === "processing") return item;
+        return { ...item, status: asset.status, error: asset.error_message ?? undefined };
+      }));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "请求失败");
     } finally {
@@ -92,30 +157,153 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, [assets, loadAssets, query]);
 
-  async function upload(file: File) {
-    setUploading(true);
-    setMessage("");
-    const form = new FormData();
-    form.append("file", file);
-    try {
-      const response = await fetch(`${API}/assets/upload`, { method: "POST", body: form });
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail ?? "上传失败");
-      }
-      setMessage("上传成功，AI 正在理解画面…");
-      await loadAssets(query);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "上传失败");
-    } finally {
-      setUploading(false);
-      if (fileRef.current) fileRef.current.value = "";
-    }
-  }
+  const processingUploadIds = uploadItems
+    .filter((item) => item.status === "processing" && item.assetId)
+    .map((item) => item.assetId)
+    .join(",");
+
+  useEffect(() => {
+    if (!processingUploadIds) return;
+    let cancelled = false;
+    const refreshUploadStatuses = async () => {
+      const ids = processingUploadIds.split(",");
+      const results = await Promise.all(ids.map(async (id) => {
+        try {
+          const response = await fetch(`${API}/assets/${id}`, { cache: "no-store" });
+          return response.ok ? await response.json() as Asset : null;
+        } catch {
+          return null;
+        }
+      }));
+      if (cancelled) return;
+      const statuses = new Map(results.filter(Boolean).map((asset) => [asset!.id, asset!]));
+      const hasCompleted = results.some((asset) => asset && asset.status !== "processing");
+      setUploadItems((items) => {
+        let changed = false;
+        const next = items.map((item) => {
+          const asset = item.assetId ? statuses.get(item.assetId) : undefined;
+          if (!asset || asset.status === "processing" || item.status !== "processing") return item;
+          changed = true;
+          return { ...item, status: asset.status, error: asset.error_message ?? undefined };
+        });
+        return changed ? next : items;
+      });
+      if (hasCompleted) await loadAssets(query);
+    };
+    refreshUploadStatuses();
+    const timer = window.setInterval(refreshUploadStatuses, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [processingUploadIds, loadAssets, query]);
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) upload(file);
+    const files = Array.from(event.target.files ?? []);
+    if (!files.length) return;
+    enqueueFiles(files);
+    event.target.value = "";
+  }
+
+  function enqueueFiles(files: File[]) {
+    setUploadItems((items) => {
+      const existing = new Set(items.map((item) => `${item.file.name}:${item.file.size}:${item.file.lastModified}`));
+      const next = files
+        .filter((file) => !existing.has(`${file.name}:${file.size}:${file.lastModified}`))
+        .map((file) => ({
+          id: createUploadId(), file, status: "queued" as const, progress: 0,
+        }));
+      return [...items, ...next];
+    });
+  }
+
+  async function readDroppedEntry(entry: DroppedEntry): Promise<File[]> {
+    if (entry.isFile && entry.file) {
+      return new Promise((resolve) => entry.file!((file) => resolve([file])));
+    }
+    if (!entry.isDirectory || !entry.createReader) return [];
+    const reader = entry.createReader();
+    const entries: DroppedEntry[] = [];
+    const readBatch = (): Promise<void> => new Promise((resolve) => reader.readEntries(async (batch) => {
+      if (!batch.length) return resolve();
+      entries.push(...batch);
+      await readBatch();
+      resolve();
+    }));
+    await readBatch();
+    return (await Promise.all(entries.map(readDroppedEntry))).flat();
+  }
+
+  async function onDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    const items = Array.from(event.dataTransfer.items ?? []);
+    const entries = items.map((item) => (item as DataTransferItem & { webkitGetAsEntry?: () => DroppedEntry | null }).webkitGetAsEntry?.()).filter(Boolean) as DroppedEntry[];
+    const files = entries.length
+      ? (await Promise.all(entries.map(readDroppedEntry))).flat()
+      : Array.from(event.dataTransfer.files ?? []);
+    if (files.length) enqueueFiles(files);
+  }
+
+  const startUpload = useCallback((item: UploadItem) => {
+    const xhr = new XMLHttpRequest();
+    activeUploads.current.set(item.id, xhr);
+    xhr.open("POST", `${API}/assets/upload`);
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const progress = Math.min(99, Math.round((event.loaded / event.total) * 100));
+      setUploadItems((items) => items.map((candidate) => candidate.id === item.id ? { ...candidate, progress } : candidate));
+    };
+    xhr.onload = async () => {
+      activeUploads.current.delete(item.id);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const asset: Asset = JSON.parse(xhr.responseText);
+        setUploadItems((items) => items.map((candidate) => candidate.id === item.id
+          ? { ...candidate, status: "processing", progress: 100, assetId: asset.id, error: undefined }
+          : candidate));
+        await loadAssets();
+      } else {
+        let error = "上传失败";
+        try { error = JSON.parse(xhr.responseText).detail ?? error; } catch { /* Keep the fallback message. */ }
+        setUploadItems((items) => items.map((candidate) => candidate.id === item.id ? { ...candidate, status: "failed", error } : candidate));
+      }
+    };
+    xhr.onerror = () => {
+      activeUploads.current.delete(item.id);
+      setUploadItems((items) => items.map((candidate) => candidate.id === item.id ? { ...candidate, status: "failed", error: "网络连接失败" } : candidate));
+    };
+    xhr.onabort = () => {
+      activeUploads.current.delete(item.id);
+      setUploadItems((items) => items.filter((candidate) => candidate.id !== item.id));
+    };
+    const form = new FormData();
+    form.append("file", item.file);
+    xhr.send(form);
+  }, [loadAssets]);
+
+  useEffect(() => {
+    const available = uploadConcurrency - activeUploads.current.size;
+    if (available <= 0) return;
+    const queued = uploadItems.filter((item) => item.status === "queued" && !activeUploads.current.has(item.id)).slice(0, available);
+    if (!queued.length) return;
+    queued.forEach((item) => activeUploads.current.set(item.id, null));
+    setUploadItems((items) => items.map((item) => queued.some((candidate) => candidate.id === item.id) ? { ...item, status: "uploading" } : item));
+    queued.forEach(startUpload);
+  }, [startUpload, uploadConcurrency, uploadItems]);
+
+  function removeUpload(item: UploadItem) {
+    const request = activeUploads.current.get(item.id);
+    if (request) request.abort();
+    else setUploadItems((items) => items.filter((candidate) => candidate.id !== item.id));
+  }
+
+  async function retryUpload(item: UploadItem) {
+    if (item.assetId) {
+      setUploadItems((items) => items.map((candidate) => candidate.id === item.id ? { ...candidate, status: "processing", error: undefined } : candidate));
+      const response = await fetch(`${API}/assets/${item.assetId}/reanalyze`, { method: "POST" });
+      if (!response.ok) setUploadItems((items) => items.map((candidate) => candidate.id === item.id ? { ...candidate, status: "failed", error: "重新分析失败" } : candidate));
+      return;
+    }
+    setUploadItems((items) => items.map((candidate) => candidate.id === item.id ? { ...candidate, status: "queued", progress: 0, error: undefined } : candidate));
   }
 
   function search(event: FormEvent) {
@@ -158,11 +346,52 @@ export default function Home() {
           <h1 className="text-3xl font-semibold tracking-tight text-white sm:text-4xl">素材资产中心</h1>
           <p className="mt-2 max-w-xl text-sm leading-6 text-slate-400">统一管理图片、视频和音频；自动解析媒体信息，并由多模态模型理解视觉内容。</p>
         </div>
-        <label className="inline-flex cursor-pointer items-center justify-center rounded-xl bg-teal-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-teal-300 has-[:disabled]:cursor-wait has-[:disabled]:opacity-60">
-          {uploading ? "正在上传…" : "+ 上传素材"}
-          <input ref={fileRef} disabled={uploading} onChange={onFileChange} type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-matroska,video/webm,audio/mpeg,audio/wav,audio/mp4,audio/flac,audio/ogg,.m4a,.mkv" className="sr-only" />
-        </label>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <button type="button" onClick={() => setFredOpen(true)} className="inline-flex items-center justify-center rounded-lg border border-white/15 bg-white/[.06] px-5 py-3 text-sm font-semibold text-white transition hover:border-teal-400/40 hover:bg-white/10">生成财经图表</button>
+          <button type="button" onClick={() => setExternalOpen(true)} className="inline-flex items-center justify-center rounded-lg border border-white/15 bg-white/[.06] px-5 py-3 text-sm font-semibold text-white transition hover:border-teal-400/40 hover:bg-white/10">从素材平台导入</button>
+          <label onDragOver={(event) => event.preventDefault()} onDrop={onDrop} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg bg-teal-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-teal-300">
+            <span>+ 批量上传素材</span><span className="text-[11px] font-normal text-slate-700">可拖拽文件夹</span>
+            <input ref={fileRef} multiple onChange={onFileChange} type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-matroska,video/webm,audio/mpeg,audio/wav,audio/mp4,audio/flac,audio/ogg,.m4a,.mkv" className="sr-only" />
+          </label>
+        </div>
       </header>
+
+      {uploadItems.length > 0 && <section className="mb-7 border-y border-white/10 bg-white/[.025] py-5">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-white">上传队列</h2>
+            <p className="mt-1 text-xs text-slate-500">
+              {uploadItems.filter((item) => item.status === "ready").length} 完成 · {uploadItems.filter((item) => item.status === "failed").length} 失败 · {uploadItems.length} 个文件
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs text-slate-500">上传并发</span>
+            <div className="flex rounded-lg border border-white/10 bg-black/20 p-1">
+              {([1, 3, 5] as const).map((value) => <button key={value} type="button" onClick={() => setUploadConcurrency(value)} className={`h-8 min-w-9 rounded-md text-xs font-medium transition ${uploadConcurrency === value ? "bg-teal-400 text-slate-950" : "text-slate-400 hover:bg-white/5 hover:text-white"}`}>{value}</button>)}
+            </div>
+            <button type="button" onClick={() => setUploadItems((items) => items.filter((item) => item.status !== "ready"))} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-slate-400 hover:bg-white/5 hover:text-white">清除已完成</button>
+          </div>
+        </div>
+        <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+          {uploadItems.map((item) => <div key={item.id} className="grid gap-3 border-b border-white/[.07] px-1 py-3 last:border-0 sm:grid-cols-[minmax(0,1fr)_150px_88px] sm:items-center">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="truncate text-sm text-slate-200" title={item.file.name}>{item.file.name}</span>
+                <span className="shrink-0 text-[11px] text-slate-600">{(item.file.size / 1024 / 1024).toFixed(2)} MB</span>
+              </div>
+              {item.error && <p className="mt-1 truncate text-xs text-red-300" title={item.error}>{item.error}</p>}
+            </div>
+            <div>
+              <div className="mb-1 flex justify-between text-[11px]"><span className={item.status === "failed" ? "text-red-300" : item.status === "ready" ? "text-emerald-300" : "text-slate-400"}>{uploadStatusText[item.status]}</span><span className="text-slate-600">{item.progress}%</span></div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-white/[.07]"><div className={`h-full transition-all ${item.status === "failed" ? "bg-red-400" : item.status === "ready" ? "bg-emerald-400" : "bg-teal-400"}`} style={{ width: `${item.progress}%` }} /></div>
+            </div>
+            <div className="flex justify-end gap-2">
+              {item.status === "failed" && <button type="button" onClick={() => retryUpload(item)} className="rounded-md border border-teal-400/20 px-2.5 py-1.5 text-xs text-teal-300 hover:bg-teal-400/10">重试</button>}
+              {(item.status === "queued" || item.status === "uploading" || item.status === "failed" || item.status === "ready") && <button type="button" onClick={() => removeUpload(item)} aria-label={`移除 ${item.file.name}`} className="rounded-md border border-white/10 px-2.5 py-1.5 text-xs text-slate-500 hover:bg-white/5 hover:text-white">移除</button>}
+            </div>
+          </div>)}
+        </div>
+      </section>}
 
       <section className="mb-7 flex flex-col gap-3 sm:flex-row sm:items-center">
         <form onSubmit={search} className="flex min-w-0 flex-1 gap-2">
@@ -174,7 +403,7 @@ export default function Home() {
           <span>{visibleAssets.length} 项素材</span>
         </div>
       </section>
-      {queryTerms.length > 1 && <div className="-mt-4 mb-6 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-600"><span>语义扩展：</span>{queryTerms.slice(1).map((term) => <span key={term} className="rounded-full border border-white/[.07] px-2 py-1 text-slate-500">{term}</span>)}</div>}
+      {queryTerms.length > 1 && <div className="-mt-4 mb-6 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-600"><span>素材相关扩展：</span>{queryTerms.slice(1).map((term) => <button type="button" key={term} aria-label={`搜索 ${term}`} onClick={() => { setQuery(term); setLoading(true); loadAssets(term); }} className="rounded-full border border-white/[.07] px-2 py-1 text-slate-500 transition hover:border-teal-400/30 hover:bg-teal-400/10 hover:text-teal-300">{term}</button>)}</div>}
 
       <section className="mb-6 flex items-center gap-3 overflow-x-auto pb-1 text-xs">
         <span className="shrink-0 text-slate-600">题材分类</span>
@@ -227,11 +456,14 @@ export default function Home() {
 
       {selectedAsset && <AssetDetail asset={selectedAsset} onClose={() => setSelectedAsset(null)} onSaved={(next) => { setSelectedAsset(next); setAssets((items) => items.map((item) => item.id === next.id ? next : item)); }} onDeleted={(id) => { setSelectedAsset(null); setAssets((items) => items.filter((item) => item.id !== id)); }} />}
       {deleteTarget && <DeleteConfirm asset={deleteTarget} deleting={deleting} onCancel={() => setDeleteTarget(null)} onConfirm={confirmDelete} />}
+      {externalOpen && <ExternalAssetBrowser onClose={() => setExternalOpen(false)} onImported={async (provider) => { setMessage(`${providerText[provider]} 素材已导入，正在进行 AI 分析`); await loadAssets(query); }} />}
+      {fredOpen && <FredChartBuilder onClose={() => setFredOpen(false)} onCreated={async () => { setMessage("FRED 财经图表已生成，正在进行 AI 分析"); await loadAssets(query); }} />}
     </main>
   );
 }
 
 function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onClose: () => void; onSaved: (asset: Asset) => void; onDeleted: (id: string) => void }) {
+  const [name, setName] = useState(asset.original_name);
   const [tags, setTags] = useState(asset.tags);
   const [newTag, setNewTag] = useState("");
   const [categories, setCategories] = useState(asset.categories?.length ? asset.categories : [asset.category || "其他"]);
@@ -240,11 +472,12 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
   const [saving, setSaving] = useState(false);
   const [editError, setEditError] = useState("");
   async function saveMetadata() {
+    if (!name.trim()) { setEditError("素材名称不能为空"); return; }
     setSaving(true);
     setEditError("");
     try {
       const cleanedTags = Array.from(new Set(tags.map((tag) => tag.trim()).filter(Boolean)));
-      const response = await fetch(`${API}/assets/${asset.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags: cleanedTags, categories, scene, description }) });
+      const response = await fetch(`${API}/assets/${asset.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ original_name: name.trim(), tags: cleanedTags, categories, scene, description }) });
       if (!response.ok) throw new Error("素材信息保存失败");
       onSaved(await response.json());
       setTags(cleanedTags);
@@ -282,6 +515,9 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
     ["采样率", primaryStream.sample_rate ? `${primaryStream.sample_rate} Hz` : null],
     ["声道", primaryStream.channels ? `${primaryStream.channels} 声道` : null],
     ["帧率", primaryStream.r_frame_rate && primaryStream.r_frame_rate !== "0/0" ? String(primaryStream.r_frame_rate) : null],
+    ["素材来源", asset.source_type === "fred" ? "FRED" : asset.source_type in providerText ? providerText[asset.source_type as ExternalProvider] : "本地上传"],
+    ["来源作者", asset.source_author],
+    ["使用许可", asset.source_license],
     ["上传时间", new Date(asset.created_at).toLocaleString("zh-CN")],
   ].filter((row) => row[1]);
 
@@ -306,6 +542,7 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
           <aside className="border-t border-white/10 p-5 lg:border-l lg:border-t-0 lg:p-6">
               <div className="mb-6">
                 <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">内容信息（可修改）</h3>
+                <label className="mb-3 block text-xs text-slate-500">素材名称<input aria-label="素材名称" value={name} onChange={(event) => setName(event.target.value)} maxLength={255} className="mt-1.5 w-full rounded-lg border border-white/10 bg-white/[.055] px-3 py-2 text-xs text-white outline-none focus:border-teal-400/50" /></label>
                 <div className="mb-3 text-xs text-slate-500">题材分类（可多选）<div className="mt-2 flex flex-wrap gap-1.5">{Array.from(new Set([...categoryOptions, ...categories])).map((item) => { const active = categories.includes(item); return <button key={item} type="button" aria-pressed={active} onClick={() => toggleCategory(item)} className={`rounded-full border px-2.5 py-1.5 text-xs transition ${active ? "border-teal-400/40 bg-teal-400/15 text-teal-300" : "border-white/10 bg-white/[.03] text-slate-500 hover:text-slate-300"}`}>{active ? "✓ " : ""}{item}</button>; })}</div><p className="mt-1.5 text-[10px] text-slate-600">至少保留一个分类；第一个分类作为存储主目录。</p></div>
                 <label className="mb-3 block text-xs text-slate-500">具体场景<input value={scene} onChange={(event) => setScene(event.target.value)} placeholder="例如：演播室访谈" className="mt-1.5 w-full rounded-lg border border-white/10 bg-white/[.055] px-3 py-2 text-xs text-white outline-none focus:border-teal-400/50" /></label>
                 <label className="mb-4 block text-xs text-slate-500">内容描述<textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={4} className="mt-1.5 w-full resize-y rounded-lg border border-white/10 bg-white/[.055] px-3 py-2 text-xs leading-5 text-white outline-none focus:border-teal-400/50" /></label>
@@ -325,10 +562,150 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
             <div>
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">技术信息</h3>
               <dl className="divide-y divide-white/[.06] border-y border-white/[.06]">{detailRows.map(([label, value]) => <div key={String(label)} className="flex justify-between gap-4 py-2.5 text-xs"><dt className="text-slate-500">{label}</dt><dd className="text-right text-slate-300">{value}</dd></div>)}</dl>
+              {asset.source_page_url && <a href={asset.source_page_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex text-xs text-teal-300 hover:text-teal-200">查看素材原始页面 ↗</a>}
             </div>
             <button type="button" onClick={deleteAsset} className="mt-6 w-full rounded-lg border border-red-400/30 bg-red-500/10 px-4 py-2.5 text-sm font-medium text-red-300 transition hover:bg-red-500/20">删除素材</button>
           </aside>
         </div>
+      </section>
+    </div>
+  );
+}
+
+function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; onImported: (provider: ExternalProvider) => Promise<void> }) {
+  const [query, setQuery] = useState("");
+  const [provider, setProvider] = useState<ExternalProvider>("pexels");
+  const [mediaType, setMediaType] = useState<"image" | "video">("image");
+  const [items, setItems] = useState<ExternalAsset[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [importingId, setImportingId] = useState<string | null>(null);
+  const [importedIds, setImportedIds] = useState<string[]>([]);
+
+  async function searchExternal(event: FormEvent) {
+    event.preventDefault();
+    if (!query.trim()) return;
+    setLoading(true);
+    setError("");
+    try {
+      const params = new URLSearchParams({ q: query.trim(), provider, media_type: mediaType, per_page: "12" });
+      const response = await fetch(`${API}/external-assets/search?${params}`, { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || `${providerText[provider]} 搜索失败`);
+      setItems(data.items || []);
+    } catch (searchError) {
+      setError(searchError instanceof Error ? searchError.message : `${providerText[provider]} 搜索失败`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function importAsset(item: ExternalAsset) {
+    setImportingId(item.external_id);
+    setError("");
+    try {
+      const response = await fetch(`${API}/external-assets/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: item.provider, external_id: item.external_id, media_type: item.media_type }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || `${providerText[item.provider]} 素材导入失败`);
+      setImportedIds((ids) => ids.includes(item.external_id) ? ids : [...ids, item.external_id]);
+      await onImported(item.provider);
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : `${providerText[item.provider]} 素材导入失败`);
+    } finally {
+      setImportingId(null);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-3 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="external-assets-title" className="flex max-h-[94vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-white/15 bg-[#10151d] shadow-2xl">
+        <header className="flex items-center justify-between border-b border-white/10 px-5 py-4 sm:px-6">
+          <div><div className="text-[10px] font-semibold uppercase text-teal-400">外部素材</div><h2 id="external-assets-title" className="mt-1 text-lg font-semibold text-white">从素材平台导入</h2></div>
+          <button type="button" onClick={onClose} aria-label="关闭外部素材窗口" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-xl text-slate-300 hover:bg-white/10">×</button>
+        </header>
+        <div className="flex gap-2 overflow-x-auto border-b border-white/10 px-5 pt-4 sm:px-6">{(Object.entries(providerText) as [ExternalProvider, string][]).map(([value, label]) => <button key={value} type="button" onClick={() => { setProvider(value); if (value === "unsplash" || value === "openverse") setMediaType("image"); setItems([]); setError(""); }} className={`shrink-0 border-b-2 px-3 pb-3 text-sm font-medium transition ${provider === value ? "border-teal-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300"}`}>{label}</button>)}</div>
+        <form onSubmit={searchExternal} className="flex flex-col gap-3 border-b border-white/10 p-5 sm:flex-row sm:p-6">
+          <div className="flex shrink-0 rounded-lg border border-white/10 bg-black/20 p-1">
+            {([['image', '图片'], ['video', '视频']] as const).map(([value, label]) => <button key={value} type="button" disabled={(provider === "unsplash" || provider === "openverse") && value === "video"} onClick={() => { setMediaType(value); setItems([]); }} className={`h-9 px-4 text-xs disabled:cursor-not-allowed disabled:opacity-30 ${mediaType === value ? "rounded-md bg-teal-400 text-slate-950" : "text-slate-400"}`}>{label}</button>)}
+          </div>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索 ${providerText[provider]}，例如：城市夜景、数据中心`} className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/[.055] px-4 py-2.5 text-sm text-white outline-none placeholder:text-slate-600 focus:border-teal-400/60" />
+          <button disabled={loading || !query.trim()} className="h-11 rounded-lg bg-teal-400 px-6 text-sm font-semibold text-slate-950 disabled:opacity-50">{loading ? "搜索中…" : "搜索"}</button>
+        </form>
+        {error && <div className="mx-5 mt-4 rounded-lg border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm text-red-300 sm:mx-6">{error}</div>}
+        <div className="min-h-64 flex-1 overflow-y-auto p-5 sm:p-6">
+          {!loading && !items.length && <div className="flex min-h-56 items-center justify-center text-sm text-slate-500">输入关键词搜索 {providerText[provider]} {provider === "unsplash" || provider === "openverse" ? "图片" : "图片或视频"}</div>}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">{items.map((item) => {
+            const imported = importedIds.includes(item.external_id);
+            const importing = importingId === item.external_id;
+            return <article key={`${item.media_type}-${item.external_id}`} className="overflow-hidden rounded-lg border border-white/10 bg-white/[.035]">
+              <a href={item.source_page_url} target="_blank" rel="noreferrer" className="block aspect-video overflow-hidden bg-black/30"><img src={item.preview_url} alt={item.title} className="h-full w-full object-cover transition hover:scale-[1.02]" /></a>
+              <div className="p-3"><h3 title={item.title} className="truncate text-sm font-medium text-white">{item.title}</h3><p className="mt-1 truncate text-xs text-slate-500">作者：{item.author || `${providerText[item.provider]} 创作者`}</p>{item.license && <p className="mt-1 truncate text-[11px] text-emerald-400">许可：{item.license}</p>}
+                <button type="button" disabled={importing || imported || importingId !== null} onClick={() => importAsset(item)} className="mt-3 h-9 w-full rounded-md bg-teal-400/15 text-xs font-semibold text-teal-300 transition hover:bg-teal-400/25 disabled:opacity-50">{importing ? "正在下载…" : imported ? "已导入" : "导入素材库"}</button>
+              </div>
+            </article>;
+          })}</div>
+        </div>
+        <footer className="border-t border-white/10 px-5 py-3 text-[11px] text-slate-500 sm:px-6">素材由 {providerText[provider]} 提供。导入前请确认其许可证适用于你的使用场景。</footer>
+      </section>
+    </div>
+  );
+}
+
+function FredChartBuilder({ onClose, onCreated }: { onClose: () => void; onCreated: () => Promise<void> }) {
+  const [series, setSeries] = useState<FredSeries[]>([]);
+  const [seriesId, setSeriesId] = useState("CPIAUCSL");
+  const [years, setYears] = useState(10);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [created, setCreated] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API}/fred/series`, { cache: "no-store" })
+      .then((response) => response.json())
+      .then((data) => { if (!cancelled) setSeries(data.items || []); })
+      .catch(() => { if (!cancelled) setError("无法加载 FRED 指标列表"); });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function generate(event: FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
+    setCreated(false);
+    try {
+      const response = await fetch(`${API}/fred/charts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ series_id: seriesId, years }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "FRED 图表生成失败");
+      setCreated(true);
+      await onCreated();
+    } catch (generateError) {
+      setError(generateError instanceof Error ? generateError.message : "FRED 图表生成失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="fred-chart-title" className="w-full max-w-2xl overflow-hidden rounded-xl border border-white/15 bg-[#10151d] shadow-2xl">
+        <header className="flex items-center justify-between border-b border-white/10 px-5 py-4 sm:px-6"><div><div className="text-[10px] font-semibold uppercase text-teal-400">财经数据素材</div><h2 id="fred-chart-title" className="mt-1 text-lg font-semibold text-white">生成 FRED 财经图表</h2></div><button type="button" onClick={onClose} aria-label="关闭 FRED 图表窗口" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-xl text-slate-300 hover:bg-white/10">×</button></header>
+        <form onSubmit={generate} className="p-5 sm:p-6">
+          <label className="block text-xs text-slate-500">经济指标<select value={seriesId} onChange={(event) => setSeriesId(event.target.value)} className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-[#171d26] px-3 text-sm text-white outline-none focus:border-teal-400/60">{series.map((item) => <option key={item.id} value={item.id}>{item.short} · {item.label}</option>)}</select></label>
+          <div className="mt-5 text-xs text-slate-500">时间范围<div className="mt-2 grid grid-cols-4 gap-2">{[5, 10, 20, 30].map((value) => <button key={value} type="button" onClick={() => setYears(value)} className={`h-10 rounded-lg border text-sm ${years === value ? "border-teal-400/40 bg-teal-400/15 text-teal-300" : "border-white/10 text-slate-400 hover:bg-white/5"}`}>{value} 年</button>)}</div></div>
+          <div className="mt-5 border-y border-white/[.07] py-4 text-xs leading-5 text-slate-500">生成 1600 × 900 PNG，自动保存到素材库并进行 AI 描述、分类和标签分析。数据来源及 FRED Series ID 会写入图片和素材详情。</div>
+          {error && <div className="mt-4 rounded-lg border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">{error}</div>}
+          {created && <div className="mt-4 rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">图表已生成并加入素材库</div>}
+          <button disabled={loading || !series.length} className="mt-5 h-11 w-full rounded-lg bg-teal-400 text-sm font-semibold text-slate-950 hover:bg-teal-300 disabled:opacity-50">{loading ? "正在获取数据并绘图…" : "生成并加入素材库"}</button>
+        </form>
       </section>
     </div>
   );

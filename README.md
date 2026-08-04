@@ -4,7 +4,9 @@ AI Video Factory 第一阶段的素材资产中心 Demo。该模块用于统一�
 
 ## 已实现功能
 
-- 上传和管理图片、视频、音频素材
+- 批量上传和管理图片、视频、音频素材
+- 上传并发可在界面选择 1、3 或 5，默认同时上传 3 个文件
+- 支持将文件夹直接拖拽到“批量上传素材”区域，递归读取其中的文件
 - 使用 MinIO 保存原始文件和缩略图
 - 使用 MySQL 保存文件信息、描述、场景、分类和标签
 - 使用 FFmpeg/FFprobe 提取视频时长、分辨率、关键帧及音频技术信息
@@ -13,12 +15,12 @@ AI Video Factory 第一阶段的素材资产中心 Demo。该模块用于统一�
 - 按图片、视频、音频和题材分类浏览素材
 - 一个素材可属于多个题材分类
 - 根据文件名、描述、场景、分类和标签检索素材
-- 使用 Qwen 查询扩展和本地同义词进行语义相似检索
+- 使用 Qwen3-Embedding-8B、Qdrant 和关键词召回进行混合语义检索
 - 查看素材详情，播放或预览原始素材
-- 修改描述、场景、分类和标签
+- 修改素材名称、描述、场景、分类和标签
 - 重新分析或删除素材
 
-> 当前语义检索采用“查询扩词 + 数据库匹配”，不是向量数据库检索。例如搜索“对谈”时，会同时搜索“访谈、谈话、对话、采访”等相关词。
+> 当前搜索采用混合检索：Qwen3-Embedding-8B + Qdrant 提供向量语义召回，原有查询扩词和数据库匹配提供关键词召回；两路结果合并后按相关度排序。向量服务暂时不可用时会自动降级为关键词检索。
 
 ## 技术架构
 
@@ -30,6 +32,8 @@ AI Video Factory 第一阶段的素材资产中心 Demo。该模块用于统一�
 | 文件存储 | MinIO | 9100 / 9101 | 保存原始素材和缩略图 |
 | 媒体处理 | FFmpeg / FFprobe | - | 媒体信息解析和视频抽帧 |
 | 视觉与文本理解 | Qwen3.5-35B-A3B | 外部服务 | 描述、分类、标签及查询扩展 |
+| 文本向量化 | Qwen3-Embedding-8B | 外部服务 | 将素材元数据和查询转换为 4096 维向量 |
+| 向量索引 | Qdrant | 6333 / 6334 | 语义相似度检索和分类过滤 |
 | 音频转写 | faster-whisper | 后端本地运行 | ASR 语音转写 |
 
 调用关系：
@@ -75,6 +79,10 @@ AI Video Factory 第一阶段的素材资产中心 Demo。该模块用于统一�
    VISION_API_BASE_URL=http://114.113.151.16:8000/v1
    VISION_MODEL=Qwen3.5-35B-A3B
    VISION_API_KEY=
+   PEXELS_API_KEY=your_pexels_api_key
+   PIXABAY_API_KEY=your_pixabay_api_key
+   UNSPLASH_ACCESS_KEY=your_unsplash_access_key
+   FRED_API_KEY=your_fred_api_key
    ```
 
    当前示例 Qwen 服务不要求 API Key，因此 `VISION_API_KEY` 可以为空。更换为需要鉴权的服务时，在此填写对应密钥。不要把包含真实密码或密钥的 `.env` 提交到 Git。
@@ -144,6 +152,8 @@ docker compose up -d
 - `ready`：处理完成
 - `failed`：处理失败，可查看 `error_message`
 
+批量上传由前端对单文件上传接口进行并发调度，每个文件独立成功或失败。后端使用进程内信号量，最多同时执行 2 个 FFmpeg、Whisper 或 Qwen 分析任务；其余已上传素材等待分析槽位。当前方案不依赖 Redis，后端进程重启时正在执行或等待的任务不会自动恢复。
+
 ## 支持的文件格式
 
 | 类型 | 格式 |
@@ -178,6 +188,32 @@ curl.exe -X POST "http://localhost:8000/api/assets/upload" `
   -F "file=@E:\media\example.mp4"
 ```
 
+### 外部开放素材与 FRED 图表
+
+外部素材平台统一使用搜索和导入接口。Openverse 只返回 `CC0`、Public Domain、`CC BY` 和 `CC BY-SA` 图片，并在导入时保存作者、许可证及原始页面。
+
+```http
+GET /api/external-assets/search?provider=openverse&q=stock%20exchange&media_type=image
+POST /api/external-assets/import
+```
+
+```json
+{"provider":"openverse","external_id":"素材 ID","media_type":"image"}
+```
+
+FRED 图表支持 CPI、联邦基金利率、失业率、GDP、十年期美债收益率和 WTI 原油价格：
+
+```http
+GET /api/fred/series
+POST /api/fred/charts
+```
+
+```json
+{"series_id":"CPIAUCSL","years":10}
+```
+
+图表以 1600 × 900 PNG 保存到 MinIO，并进入现有 AI 分析流程。FRED 汇聚数据的使用条件可能因系列而异，正式发布前仍需查看对应 Series 页面说明。
+
 ### 查询和语义搜索
 
 ```http
@@ -191,11 +227,61 @@ GET /api/assets?q=人工智能&media_type=image&category=科技
 
 | 参数 | 可选值/含义 |
 | --- | --- |
-| `q` | 搜索文件名、描述、场景、分类和标签，并进行语义扩词 |
+| `q` | 对文件名、描述、场景、分类、标签和视频帧描述进行混合语义检索 |
 | `media_type` | `image`、`video` 或 `audio` |
 | `category` | 题材分类名称，例如 `财经`、`科技` |
 
-响应中的 `query_terms` 表示实际参与匹配的语义扩展词。
+响应中的 `query_terms` 表示从候选素材的文件名、描述、场景、分类和标签中提取出的真实相关短语。通用近义词仍用于内部召回，但不会作为素材相关扩展展示。
+
+#### 向量生成与同步
+
+MySQL 是素材元数据的事实源，Qdrant 是可以从 MySQL 重新生成的语义检索索引。系统不会将整条 SQL 记录直接迁移到 Qdrant，而是为每个 `ready` 素材拼接以下检索文本：
+
+```text
+素材类型：video
+名称：财经访谈.mp4
+描述：主持人与嘉宾讨论市场走势和资产配置。
+场景：财经演播室主持人进行市场分析访谈
+题材：财经、金融市场
+标签：主持人、嘉宾、市场走势、资产配置
+视频画面：主持人站在屏幕前；嘉宾展示走势图；双方进行交流
+语音内容：今天我们讨论近期市场变化……
+```
+
+参与向量化的字段包括：
+
+- `media_type`：素材类型
+- `original_name`：素材名称
+- `description`：AI 生成或人工修改的内容描述
+- `scene`：具体场景
+- `categories`：题材分类
+- `tags`：检索标签
+- `media_metadata.frame_analysis[].description`：视频抽帧描述
+- `media_metadata.transcript`：音频转写，最多使用前 6000 个字符
+
+后端将上述文本发送给 `Qwen3-Embedding-8B`，生成 4096 维向量，并以素材 UUID 作为 point ID 写入 Qdrant collection `assets_qwen3_embedding_8b_v1`。Qdrant payload 只保存用于关联和过滤的少量字段：
+
+```json
+{
+  "asset_id": "与 MySQL 素材 ID 相同",
+  "media_type": "video",
+  "categories": ["财经", "金融市场"],
+  "status": "ready"
+}
+```
+
+索引同步规则：
+
+- 后端启动时在后台扫描全部 `ready` 素材，补建或覆盖对应向量
+- 新素材分析成功后自动生成向量
+- 人工修改名称、描述、场景、分类或标签后自动覆盖向量
+- 删除素材时同步删除 Qdrant point
+- 重新分析素材时先删除旧向量，分析成功后写入新向量
+- Qdrant 或 Embedding 服务暂时不可用时，素材处理和关键词检索仍可使用；下次后端启动会再次补建缺失向量
+
+用户查询会使用同一个 Embedding 模型生成查询向量。最终排序分数为 `75%` 向量相似度加 `25%` 关键词命中分，并支持 `media_type` 和 `category` 过滤。响应中的 `search_score` 表示该综合相关度；未提供 `q` 时该字段为 `null`。
+
+Qdrant 管理界面位于 `http://localhost:6333/dashboard`。素材数量较少时，面板可能显示 `indexed_vectors_count = 0`，这是因为 Qdrant 直接遍历少量向量而未建立 HNSW 索引，不表示向量尚未写入；实际记录数应查看 `points_count`。
 
 ### 获取详情与媒体内容
 
@@ -332,8 +418,17 @@ for asset in response.json()["items"]:
 | `MINIO_ROOT_PASSWORD` | MinIO 管理员密码 | 请在团队环境修改 |
 | `MINIO_BUCKET` | 素材 Bucket | `assets` |
 | `VISION_API_BASE_URL` | OpenAI 兼容模型服务基础地址 | `http://host:8000/v1` |
+| `PEXELS_API_KEY` | Pexels 图片和视频搜索 API Key | 空；未配置时禁用外部素材搜索 |
+| `PIXABAY_API_KEY` | Pixabay 图片和视频搜索 API Key | 空；未配置时禁用 Pixabay 搜索 |
+| `UNSPLASH_ACCESS_KEY` | Unsplash 图片搜索 Access Key | 空；未配置时禁用 Unsplash 搜索 |
+| `FRED_API_KEY` | FRED 宏观经济数据 API Key | 空；未配置时禁用财经图表生成 |
 | `VISION_MODEL` | 模型名称 | `Qwen3.5-35B-A3B` |
 | `VISION_API_KEY` | 模型服务密钥 | 无鉴权服务可为空 |
+| `EMBEDDING_API_BASE_URL` | OpenAI 兼容向量服务地址 | `http://114.113.151.16:8003/v1` |
+| `EMBEDDING_MODEL` | 向量模型名称 | `Qwen3-Embedding-8B` |
+| `EMBEDDING_DIMENSION` | 向量维度，必须与模型输出一致 | `4096` |
+| `QDRANT_URL` | Qdrant HTTP 地址 | Docker 内为 `http://qdrant:6333` |
+| `QDRANT_COLLECTION` | 素材向量集合名称 | `assets_qwen3_embedding_8b_v1` |
 | `ASR_MODEL_SIZE` | Whisper 模型大小 | `base` |
 | `NEXT_PUBLIC_API_BASE_URL` | 浏览器访问后端的地址 | `http://localhost:8000/api` |
 
@@ -350,10 +445,11 @@ Docker Compose 使用以下命名数据卷：
 - `mysql_data`：MySQL 素材元数据
 - `minio_data`：原始素材和缩略图
 - `asr_cache`：Whisper 模型缓存
+- `qdrant_data`：素材语义向量和 Qdrant 索引
 
 普通的容器重启、Docker Desktop 重启及 `docker compose down` 不会删除这些数据。
 
-生产或长期团队环境应制定 MySQL 和 MinIO 的定期备份方案。只备份其中一个会造成数据库记录和文件对象不一致。
+生产或长期团队环境应制定 MySQL 和 MinIO 的定期备份方案。只备份其中一个会造成数据库记录和文件对象不一致。Qdrant 数据可以通过 MySQL 中的素材元数据重新生成，但备份 `qdrant_data` 可以缩短故障恢复后的索引重建时间。
 
 ## 当前 Demo 限制与安全说明
 

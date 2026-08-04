@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -11,6 +12,12 @@ from .audio_analyzer import analyze_audio
 from .database import SessionLocal
 from .models import Asset, AssetStatus
 from .storage import get_object, move_object, put_bytes
+from .vector_store import safe_index_asset
+
+
+# This demo runs background analysis in the API process. Limit expensive
+# FFmpeg, Whisper, and Qwen work without introducing an external task queue.
+ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(2)
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess:
@@ -43,8 +50,9 @@ def _media_metadata(probe: dict) -> dict:
     }
 
 
-def _video_frames(path: Path, duration: float) -> list[bytes]:
-    points = [0.0] if duration <= 0.2 else [duration * 0.15, duration * 0.5, duration * 0.85]
+def _video_frames(path: Path, duration: float) -> tuple[list[bytes], list[float]]:
+    percentages = [0.05, 0.25, 0.50, 0.75, 0.95]
+    points = [duration * percentage for percentage in percentages] if duration > 0.2 else [0.0]
     frames = []
     for index, point in enumerate(points):
         output = path.parent / f"frame-{index}.jpg"
@@ -56,7 +64,7 @@ def _video_frames(path: Path, duration: float) -> list[bytes]:
             frames.append(output.read_bytes())
     if not frames:
         raise ValueError("视频中没有可提取的画面")
-    return frames
+    return frames, points[:len(frames)]
 
 
 def _process_image(asset: Asset, original: bytes) -> None:
@@ -72,6 +80,7 @@ def _process_image(asset: Asset, original: bytes) -> None:
     put_bytes(asset.thumbnail_key, thumbnail.getvalue(), "image/webp")
     analysis = analyze_image(original, asset.mime_type)
     asset.description, asset.tags, asset.scene, asset.categories = analysis["description"], analysis["tags"], analysis["scene"], analysis["categories"]
+    asset.media_metadata = {**asset.media_metadata, "analysis_version": "visual-v2"}
     asset.category = asset.categories[0] if asset.categories else "其他"
 
 
@@ -86,11 +95,12 @@ def _process_video(asset: Asset, original: bytes) -> None:
         asset.width = video_stream.get("width")
         asset.height = video_stream.get("height")
         asset.media_metadata = _media_metadata(probe)
-        frames = _video_frames(source, asset.duration or 0.0)
+        frames, frame_times = _video_frames(source, asset.duration or 0.0)
     asset.thumbnail_key = f"thumbnails/{asset.id}.jpg"
     put_bytes(asset.thumbnail_key, frames[0], "image/jpeg")
-    analysis = analyze_images([(frame, "image/jpeg") for frame in frames])
+    analysis = analyze_images([(frame, "image/jpeg") for frame in frames], frame_times=frame_times, asset_context=f"视频文件名：{asset.original_name}；时长：{asset.duration:.2f} 秒")
     asset.description, asset.tags, asset.scene, asset.categories = analysis["description"], analysis["tags"], analysis["scene"], analysis["categories"]
+    asset.media_metadata = {**asset.media_metadata, "frame_analysis": analysis.get("frame_analysis", []), "analysis_version": "visual-v2"}
     asset.category = asset.categories[0] if asset.categories else "其他"
 
 
@@ -144,7 +154,7 @@ def _process_audio(asset: Asset, original: bytes) -> None:
         asset.media_metadata = {**asset.media_metadata, "asr_error": asr_error}
 
 
-def process_asset(asset_id: str) -> None:
+def _process_asset(asset_id: str) -> None:
     db = SessionLocal()
     asset = db.get(Asset, asset_id)
     if not asset:
@@ -171,12 +181,18 @@ def process_asset(asset_id: str) -> None:
         asset.object_key = target
         asset.error_message = None
         db.commit()
+        safe_index_asset(asset)
     except Exception as exc:
         asset.status = AssetStatus.failed
         asset.error_message = str(exc)[:2000]
         db.commit()
     finally:
         db.close()
+
+
+def process_asset(asset_id: str) -> None:
+    with ANALYSIS_SEMAPHORE:
+        _process_asset(asset_id)
 
 
 # Backward-compatible import name used by older integrations.

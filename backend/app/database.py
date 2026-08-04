@@ -32,6 +32,20 @@ def migrate_demo_schema() -> None:
         statements.append("ALTER TABLE assets ADD COLUMN category VARCHAR(255) NULL")
     if "categories" not in existing:
         statements.append("ALTER TABLE assets ADD COLUMN categories JSON NULL")
+    if "source_type" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN source_type VARCHAR(30) NOT NULL DEFAULT 'upload'")
+    if "source_id" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN source_id VARCHAR(100) NULL")
+    if "source_page_url" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN source_page_url VARCHAR(1000) NULL")
+    if "source_author" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN source_author VARCHAR(255) NULL")
+    if "source_license" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN source_license VARCHAR(255) NULL")
+    if "source_metadata" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN source_metadata JSON NULL")
+    if "content_hash" not in existing:
+        statements.append("ALTER TABLE assets ADD COLUMN content_hash VARCHAR(64) NULL")
     if statements:
         with engine.begin() as connection:
             for statement in statements:
