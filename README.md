@@ -168,6 +168,8 @@ docker compose up -d
 
 完整、可交互的接口文档位于：http://localhost:8000/docs
 
+完整接口说明见 [API.md](API.md)，在线运行时也可以访问 `http://localhost:8000/docs` 查看交互式 OpenAPI 文档。
+
 ### 健康检查
 
 ```http
@@ -188,7 +190,7 @@ curl.exe -X POST "http://localhost:8000/api/assets/upload" `
   -F "file=@E:\media\example.mp4"
 ```
 
-### 外部开放素材与 FRED 图表
+### 外部开放素材导入
 
 外部素材平台统一使用搜索和导入接口。Openverse 只返回 `CC0`、Public Domain、`CC BY` 和 `CC BY-SA` 图片，并在导入时保存作者、许可证及原始页面。
 
@@ -201,35 +203,27 @@ POST /api/external-assets/import
 {"provider":"openverse","external_id":"素材 ID","media_type":"image"}
 ```
 
-FRED 图表支持 CPI、联邦基金利率、失业率、GDP、十年期美债收益率和 WTI 原油价格：
+导入成功后，系统将原始素材保存到 MinIO，在 MySQL 中创建本地素材记录，并在后台自动生成描述、场景、题材分类和标签。分析成功后，素材状态变为 `ready`，同时写入 Qdrant 语义向量索引。
 
-```http
-GET /api/fred/series
-POST /api/fred/charts
-```
+首页输入语义搜索词时会同时展示本地素材和外部素材。外部素材卡片带有“导入素材库”按钮，点击后会直接调用 `POST /api/external-assets/import`；导入成功后，当前卡片会替换为本地素材并显示 AI 分析状态。同一 provider 和素材 ID 重复导入时，后端返回已有的本地素材，不会重复保存文件。
 
-```json
-{"series_id":"CPIAUCSL","years":10}
-```
-
-图表以 1600 × 900 PNG 保存到 MinIO，并进入现有 AI 分析流程。FRED 汇聚数据的使用条件可能因系列而异，正式发布前仍需查看对应 Series 页面说明。
+> FRED 图表接口当前已停用，`GET /api/fred/series` 和 `POST /api/fred/charts` 返回 `410 Gone`。
 
 ### 查询和语义搜索
 
 ```http
-GET /api/assets?q=对谈
-GET /api/assets?media_type=video
-GET /api/assets?category=财经
-GET /api/assets?q=人工智能&media_type=image&category=科技
+GET /api/assets
+GET /api/search?q=对谈
+GET /api/search?q=人工智能&media_type=image
 ```
 
 参数说明：
 
 | 参数 | 可选值/含义 |
 | --- | --- |
-| `q` | 对文件名、描述、场景、分类、标签和视频帧描述进行混合语义检索 |
-| `media_type` | `image`、`video` 或 `audio` |
-| `category` | 题材分类名称，例如 `财经`、`科技` |
+| `q` | 必填；对本地和外部素材执行统一检索 |
+| `media_type` | 可选；`image` 或 `video`，不传时同时检索两者 |
+| `category` | 本地素材检索可使用题材分类过滤，例如 `财经`、`科技` |
 
 响应中的 `query_terms` 表示从候选素材的文件名、描述、场景、分类和标签中提取出的真实相关短语。通用近义词仍用于内部召回，但不会作为素材相关扩展展示。
 
@@ -261,6 +255,8 @@ MySQL 是素材元数据的事实源，Qdrant 是可以从 MySQL 重新生成的
 
 后端将上述文本发送给 `Qwen3-Embedding-8B`，生成 4096 维向量，并以素材 UUID 作为 point ID 写入 Qdrant collection `assets_qwen3_embedding_8b_v1`。Qdrant payload 只保存用于关联和过滤的少量字段：
 
+这 4096 个维度是模型生成的浮点数语义特征，不分别对应“名称维度”“题材维度”或“标签维度”。名称、描述、场景、题材和标签等原始字段仍完整保存在 MySQL 中；Qdrant 中的向量只用于计算语义相似度。
+
 ```json
 {
   "asset_id": "与 MySQL 素材 ID 相同",
@@ -282,6 +278,14 @@ MySQL 是素材元数据的事实源，Qdrant 是可以从 MySQL 重新生成的
 用户查询会使用同一个 Embedding 模型生成查询向量。最终排序分数为 `75%` 向量相似度加 `25%` 关键词命中分，并支持 `media_type` 和 `category` 过滤。响应中的 `search_score` 表示该综合相关度；未提供 `q` 时该字段为 `null`。
 
 Qdrant 管理界面位于 `http://localhost:6333/dashboard`。素材数量较少时，面板可能显示 `indexed_vectors_count = 0`，这是因为 Qdrant 直接遍历少量向量而未建立 HNSW 索引，不表示向量尚未写入；实际记录数应查看 `points_count`。
+
+#### 数据存储职责
+
+| 组件 | 保存内容 | 主要用途 |
+| --- | --- | --- |
+| MinIO | 原始图片、视频及缩略图 | 媒体文件存储和读取 |
+| MySQL | 素材名、描述、场景、题材、标签、来源及媒体信息 | 完整素材详情和事实数据源 |
+| Qdrant | 4096 维语义向量，以及 `asset_id`、媒体类型、题材和状态 | 语义相似度召回和条件过滤 |
 
 ### 获取详情与媒体内容
 
