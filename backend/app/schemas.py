@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .models import AssetStatus
 
@@ -50,6 +50,15 @@ class AssetUpdate(BaseModel):
     tags: list[str] | None = Field(default=None, max_length=30)
 
 
+class AssetBatchDelete(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class AssetBatchDeleteResult(BaseModel):
+    deleted_ids: list[str]
+    failed: dict[str, str]
+
+
 class ExternalAssetOut(BaseModel):
     provider: str
     external_id: str
@@ -73,7 +82,7 @@ class ExternalAssetList(BaseModel):
 
 
 class ExternalAssetImport(BaseModel):
-    provider: str = Field(pattern="^(pexels|pixabay|unsplash|openverse)$")
+    provider: str = Field(pattern="^(pexels|pixabay|unsplash|openverse|mixkit)$")
     external_id: str = Field(min_length=1, max_length=100)
     media_type: str = Field(pattern="^(image|video)$")
 
@@ -81,3 +90,24 @@ class ExternalAssetImport(BaseModel):
 class FredChartCreate(BaseModel):
     series_id: str = Field(min_length=1, max_length=30)
     years: int = Field(default=10, ge=1, le=50)
+
+
+class AssetExportRequest(BaseModel):
+    ratio: str = Field(pattern="^(9:16|16:9|4:3|3:4)$")
+    width: int = Field(ge=240, le=3840)
+    height: int = Field(ge=240, le=3840)
+    mode: str = Field(default="smart", pattern="^(smart|contain)$")
+    focus_mode: str = Field(default="auto", pattern="^(auto|manual)$")
+    focus_x: float = Field(default=0.5, ge=0, le=1)
+    focus_y: float = Field(default=0.5, ge=0, le=1)
+    zoom: float = Field(default=1, ge=1, le=3)
+    track_subject: bool = True
+
+    @model_validator(mode="after")
+    def validate_dimensions(self):
+        ratio_width, ratio_height = (int(value) for value in self.ratio.split(":"))
+        if abs((self.width / self.height) - (ratio_width / ratio_height)) > 0.01:
+            raise ValueError("分辨率与所选比例不匹配")
+        if self.width % 2 or self.height % 2:
+            raise ValueError("宽度和高度必须是偶数")
+        return self

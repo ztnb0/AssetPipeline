@@ -3,6 +3,7 @@
 import { ChangeEvent, DragEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api";
+const FORMAT_EXPORT_ENABLED = false;
 
 type Status = "processing" | "ready" | "failed";
 type UploadStatus = "queued" | "uploading" | "processing" | "ready" | "failed";
@@ -46,9 +47,11 @@ type Asset = {
   created_at: string;
   content_url: string;
   thumbnail_url: string | null;
+  search_score?: number | null;
+  external_provider?: ExternalProvider;
 };
 
-type ExternalProvider = "pexels" | "pixabay" | "unsplash" | "openverse";
+type ExternalProvider = "pexels" | "pixabay" | "unsplash" | "openverse" | "mixkit";
 type ExternalAsset = {
   provider: ExternalProvider;
   external_id: string;
@@ -82,7 +85,10 @@ const uploadStatusText: Record<UploadStatus, string> = {
 
 function absoluteUrl(path: string | null) {
   if (!path) return "";
-  return `${API.replace(/\/api$/, "")}${path}`;
+  // External providers return absolute CDN URLs; only resolve API-relative paths.
+  if (/^(?:https?:|data:|blob:)/i.test(path)) return path;
+  if (path.startsWith("//")) return `https:${path}`;
+  return `${API.replace(/\/api$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 function createUploadId() {
@@ -99,7 +105,7 @@ function durationText(seconds: number | null) {
 }
 
 const mediaText: Record<string, string> = { image: "图片", video: "视频", audio: "音频" };
-const providerText: Record<ExternalProvider, string> = { pexels: "Pexels", pixabay: "Pixabay", unsplash: "Unsplash", openverse: "Openverse" };
+const providerText: Record<ExternalProvider, string> = { pexels: "Pexels", pixabay: "Pixabay", unsplash: "Unsplash", openverse: "Openverse", mixkit: "Mixkit" };
 const categoryOptions = ["科技", "财经", "金融市场", "宏观经济", "金融理财", "投资管理", "保险规划", "养老规划", "税务规划", "财富传承", "私人银行", "金融教育", "财经新闻", "民生", "教育", "商业", "文化", "娱乐", "体育", "医疗", "自然", "交通", "工业", "政务", "音频制作", "待内容识别", "其他"];
 
 export default function Home() {
@@ -113,6 +119,9 @@ export default function Home() {
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Asset | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchDeleting, setBatchDeleting] = useState(false);
+  const [importingExternalId, setImportingExternalId] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [externalOpen, setExternalOpen] = useState(false);
@@ -122,14 +131,24 @@ export default function Home() {
 
   const loadAssets = useCallback(async (q = "") => {
     try {
-      const response = await fetch(`${API}/assets?q=${encodeURIComponent(q)}`, { cache: "no-store" });
+      const searchType = typeFilter === "image" || typeFilter === "video" ? `&media_type=${typeFilter}` : "";
+      const response = await fetch(q.trim() ? `${API}/search?q=${encodeURIComponent(q)}${searchType}` : `${API}/assets`, { cache: "no-store" });
       if (!response.ok) throw new Error("无法加载素材列表");
       const data = await response.json();
-      setAssets(data.items);
+      const nextAssets: Asset[] = q.trim() ? data.items.map((item: any) => item.source === "local" ? item.asset : ({
+        id: `external:${item.provider}:${item.external_id}`, original_name: item.title, media_type: item.media_type,
+        mime_type: item.media_type === "video" ? "video/mp4" : "image/jpeg", file_size: 0, width: item.width, height: item.height,
+        duration: item.duration ?? null, media_metadata: {}, status: "ready", description: `${item.provider} external asset`,
+        scene: "External", tags: [item.provider], category: "External", categories: ["External"], error_message: null,
+        source_type: "external", source_id: item.external_id, source_page_url: item.source_page_url, source_author: item.author,
+        source_license: item.license, created_at: new Date().toISOString(), content_url: item.preview_url,
+        thumbnail_url: item.preview_url, search_score: item.score, external_provider: item.provider,
+      })) : data.items;
+      setAssets(nextAssets);
       setQueryTerms(data.query_terms ?? []);
       setUploadItems((items) => items.map((item) => {
         if (!item.assetId || (item.status !== "processing" && item.status !== "ready")) return item;
-        const asset = data.items.find((candidate: Asset) => candidate.id === item.assetId);
+        const asset = nextAssets.find((candidate: Asset) => candidate.id === item.assetId);
         if (!asset || asset.status === "processing") return item;
         return { ...item, status: asset.status, error: asset.error_message ?? undefined };
       }));
@@ -138,9 +157,17 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [typeFilter]);
 
   useEffect(() => { loadAssets(); }, [loadAssets]);
+
+  useEffect(() => {
+    const availableIds = new Set(assets.map((asset) => asset.id));
+    setSelectedIds((current) => {
+      const next = new Set([...current].filter((id) => availableIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [assets]);
 
   useEffect(() => {
     if (!selectedAsset) return;
@@ -329,11 +356,83 @@ export default function Home() {
     }
   }
 
+  function toggleSelected(assetId: string) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  }
+
+  async function deleteSelected() {
+    const ids = [...selectedIds];
+    if (!ids.length || !window.confirm(`确定删除已选择的 ${ids.length} 项素材吗？原始文件、缩略图和索引也会被删除，无法恢复。`)) return;
+    setBatchDeleting(true);
+    try {
+      const response = await fetch(`${API}/assets/batch`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      if (!response.ok) throw new Error("批量删除素材失败");
+      const result: { deleted_ids: string[]; failed: Record<string, string> } = await response.json();
+      const deleted = new Set(result.deleted_ids);
+      setAssets((items) => items.filter((item) => !deleted.has(item.id)));
+      setSelectedIds(new Set(Object.keys(result.failed)));
+      if (selectedAsset && deleted.has(selectedAsset.id)) setSelectedAsset(null);
+      const failedCount = Object.keys(result.failed).length;
+      setMessage(failedCount
+        ? `已删除 ${result.deleted_ids.length} 项，${failedCount} 项删除失败并保持选中`
+        : `已删除 ${result.deleted_ids.length} 项素材`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "批量删除素材失败");
+    } finally {
+      setBatchDeleting(false);
+    }
+  }
+
+  async function importExternalAsset(asset: Asset) {
+    if (!asset.external_provider || !asset.source_id) return;
+    setImportingExternalId(asset.id);
+    setMessage("");
+    try {
+      const response = await fetch(`${API}/external-assets/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: asset.external_provider,
+          external_id: asset.source_id,
+          media_type: asset.media_type,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || `${providerText[asset.external_provider]} 素材导入失败`);
+      setAssets((items) => items.map((item) => item.id === asset.id ? data : item));
+      setMessage(`${providerText[asset.external_provider]} 素材已导入，正在进行 AI 分析`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "素材导入失败");
+    } finally {
+      setImportingExternalId(null);
+    }
+  }
+
   const visibleAssets = assets.filter((asset) =>
     (typeFilter === "all" || asset.media_type === typeFilter) &&
     (categoryFilter === "all" || (asset.categories?.length ? asset.categories : [asset.category || "其他"]).includes(categoryFilter))
   );
   const availableCategories = Array.from(new Set(assets.flatMap((asset) => asset.categories?.length ? asset.categories : [asset.category || "其他"]))).sort();
+  const visibleAssetIds = Array.from(new Set(visibleAssets.filter((asset) => asset.source_type !== "external").map((asset) => asset.id)));
+  const allVisibleSelected = visibleAssetIds.length > 0 && visibleAssetIds.every((id) => selectedIds.has(id));
+
+  function toggleAllVisible() {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allVisibleSelected) visibleAssetIds.forEach((id) => next.delete(id));
+      else visibleAssetIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-5 py-8 sm:px-8">
@@ -410,6 +509,19 @@ export default function Home() {
         {["all", ...availableCategories].map((value) => <button key={value} type="button" onClick={() => setCategoryFilter(value)} className={`shrink-0 rounded-full border px-3 py-1.5 transition ${categoryFilter === value ? "border-teal-400/30 bg-teal-400/15 text-teal-300" : "border-white/10 bg-white/[.025] text-slate-500 hover:text-slate-300"}`}>{value === "all" ? "全部题材" : value}</button>)}
       </section>
 
+      {visibleAssetIds.length > 0 && <section className="mb-6 flex flex-wrap items-center justify-between gap-3 border-y border-white/10 py-3">
+        <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+          <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="h-4 w-4 accent-teal-400" />
+          全选当前结果
+        </label>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-slate-500">已选择 {selectedIds.size} 项</span>
+          <button type="button" disabled={!selectedIds.size || batchDeleting} onClick={deleteSelected} className="rounded-lg border border-red-400/30 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40">
+            {batchDeleting ? "删除中…" : "批量删除"}
+          </button>
+        </div>
+      </section>}
+
       {message && <div className="mb-6 rounded-xl border border-teal-400/20 bg-teal-400/10 px-4 py-3 text-sm text-teal-200">{message}</div>}
 
       {loading ? (
@@ -423,15 +535,19 @@ export default function Home() {
         <div className="space-y-9">
           {Object.entries(visibleAssets.reduce<Record<string, Asset[]>>((groups, asset) => { const sections = categoryFilter === "all" ? (asset.categories?.length ? asset.categories : [asset.category || "其他"]) : [categoryFilter]; sections.forEach((section) => (groups[section] ||= []).push(asset)); return groups; }, {})).map(([section, sectionAssets]) => <section key={section}>
             <header className="mb-4 flex items-center justify-between border-b border-white/10 pb-3"><div><span className="text-[10px] font-semibold uppercase tracking-[.2em] text-teal-400">主题板块</span><h2 className="mt-1 text-lg font-semibold text-white">{section}</h2></div><span className="text-xs text-slate-500">{sectionAssets.length} 项素材</span></header>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            <div className="grid items-start gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {sectionAssets.map((asset) => (
             <article key={asset.id} role="button" tabIndex={0} aria-label={`查看 ${asset.original_name} 详情`} onClick={() => setSelectedAsset(asset)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAsset(asset); }} className="cursor-pointer overflow-hidden rounded-2xl border border-white/10 bg-[#11161e]/90 shadow-2xl shadow-black/20 transition hover:-translate-y-0.5 hover:border-teal-400/30 focus:outline-none focus:ring-2 focus:ring-teal-400/60">
-              <div className="relative aspect-video overflow-hidden bg-slate-900">
-                {asset.media_type !== "audio" && (asset.thumbnail_url || asset.content_url) && <img src={absoluteUrl(asset.thumbnail_url || asset.content_url)} alt={asset.original_name} className="h-full w-full object-cover" />}
+              <div className="relative overflow-hidden bg-slate-900" style={{ aspectRatio: asset.width && asset.height ? `${asset.width} / ${asset.height}` : "16 / 9" }}>
+                {asset.source_type !== "external" && <label className="absolute bottom-2.5 left-2.5 z-10 flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-white/20 bg-black/70 backdrop-blur" onClick={(event) => event.stopPropagation()}>
+                  <input type="checkbox" aria-label={`选择 ${asset.original_name}`} checked={selectedIds.has(asset.id)} onChange={() => toggleSelected(asset.id)} className="h-4 w-4 accent-teal-400" />
+                </label>}
+                {asset.media_type !== "audio" && (asset.thumbnail_url || asset.content_url) && <img loading="lazy" decoding="async" src={absoluteUrl(asset.thumbnail_url || asset.content_url)} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} className="h-full w-full object-contain" />}
                 {asset.media_type === "audio" && <div className="flex h-full items-center justify-center bg-gradient-to-br from-violet-950 to-slate-950"><div className="flex h-20 w-20 items-center justify-center rounded-full border border-violet-300/20 bg-violet-400/10 text-4xl text-violet-300">♫</div></div>}
                 <div className="absolute left-3 top-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-white/80 backdrop-blur">{mediaText[asset.media_type] ?? asset.media_type}</div>
+                {asset.search_score !== null && asset.search_score !== undefined && <div className="absolute left-3 top-11 rounded-md border border-teal-300/25 bg-teal-950/80 px-2 py-1 text-[10px] font-semibold text-teal-200 backdrop-blur">相关度 {(asset.search_score * 100).toFixed(0)}%</div>}
                 <div className={`absolute right-3 top-3 rounded-full border px-2.5 py-1 text-[11px] font-medium backdrop-blur ${asset.status === "ready" ? "border-emerald-300/30 bg-emerald-950/70 text-emerald-300" : asset.status === "failed" ? "border-red-300/30 bg-red-950/70 text-red-300" : "border-amber-300/30 bg-amber-950/70 text-amber-200"}`}>{statusText[asset.status]}</div>
-                <button type="button" aria-label={`删除 ${asset.original_name}`} onClick={(event) => { event.stopPropagation(); setDeleteTarget(asset); }} className="absolute bottom-2.5 right-2.5 flex h-8 w-8 items-center justify-center rounded-lg border border-red-300/20 bg-black/65 text-sm text-red-300 opacity-80 backdrop-blur transition hover:bg-red-500/25 hover:opacity-100">⌫</button>
+                {asset.source_type !== "external" && <button type="button" aria-label={`删除 ${asset.original_name}`} onClick={(event) => { event.stopPropagation(); setDeleteTarget(asset); }} className="absolute bottom-2.5 right-2.5 flex h-8 w-8 items-center justify-center rounded-lg border border-red-300/20 bg-black/65 text-sm text-red-300 opacity-80 backdrop-blur transition hover:bg-red-500/25 hover:opacity-100">⌫</button>}
               </div>
               <div className="p-4">
                 <h2 className="truncate text-sm font-semibold text-white" title={asset.original_name}>{asset.original_name}</h2>
@@ -446,6 +562,7 @@ export default function Home() {
                   {asset.tags.slice(0, 6).map((tag) => <span key={tag} className="rounded-md border border-white/10 bg-white/[.055] px-2 py-1 text-[10px] text-slate-300">{tag}</span>)}
                   {asset.tags.length > 6 && <span className="px-1 py-1 text-[10px] text-slate-600">+{asset.tags.length - 6}</span>}
                 </div>
+                {asset.source_type === "external" && <button type="button" disabled={importingExternalId !== null} onClick={(event) => { event.stopPropagation(); void importExternalAsset(asset); }} className="mt-3 h-10 w-full rounded-md bg-teal-400 text-xs font-semibold text-slate-950 transition hover:bg-teal-300 disabled:cursor-wait disabled:opacity-50">{importingExternalId === asset.id ? "正在下载并导入…" : "导入素材库"}</button>}
               </div>
             </article>
           ))}
@@ -471,6 +588,7 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
   const [description, setDescription] = useState(asset.description || "");
   const [saving, setSaving] = useState(false);
   const [editError, setEditError] = useState("");
+  const [exportOpen, setExportOpen] = useState(false);
   async function saveMetadata() {
     if (!name.trim()) { setEditError("素材名称不能为空"); return; }
     setSaving(true);
@@ -564,7 +682,119 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
               <dl className="divide-y divide-white/[.06] border-y border-white/[.06]">{detailRows.map(([label, value]) => <div key={String(label)} className="flex justify-between gap-4 py-2.5 text-xs"><dt className="text-slate-500">{label}</dt><dd className="text-right text-slate-300">{value}</dd></div>)}</dl>
               {asset.source_page_url && <a href={asset.source_page_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex text-xs text-teal-300 hover:text-teal-200">查看素材原始页面 ↗</a>}
             </div>
-            <button type="button" onClick={deleteAsset} className="mt-6 w-full rounded-lg border border-red-400/30 bg-red-500/10 px-4 py-2.5 text-sm font-medium text-red-300 transition hover:bg-red-500/20">删除素材</button>
+            {FORMAT_EXPORT_ENABLED && asset.media_type !== "audio" && asset.status === "ready" && <button type="button" onClick={() => setExportOpen(true)} className="mt-6 w-full rounded-lg bg-teal-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-teal-300">选择比例并下载</button>}
+            <button type="button" onClick={deleteAsset} className="mt-3 w-full rounded-lg border border-red-400/30 bg-red-500/10 px-4 py-2.5 text-sm font-medium text-red-300 transition hover:bg-red-500/20">删除素材</button>
+          </aside>
+        </div>
+      </section>
+      {exportOpen && <ExportEditor asset={asset} onClose={() => setExportOpen(false)} />}
+    </div>
+  );
+}
+
+type ExportRatio = "9:16" | "16:9" | "4:3" | "3:4";
+type ExportMode = "smart" | "contain";
+
+const exportPresets: Record<ExportRatio, Array<[number, number]>> = {
+  "9:16": [[1080, 1920], [720, 1280]],
+  "16:9": [[1920, 1080], [1280, 720]],
+  "4:3": [[1600, 1200], [1024, 768]],
+  "3:4": [[1200, 1600], [768, 1024]],
+};
+
+function ExportEditor({ asset, onClose }: { asset: Asset; onClose: () => void }) {
+  const [ratio, setRatio] = useState<ExportRatio>("9:16");
+  const [resolutionIndex, setResolutionIndex] = useState(0);
+  const [mode, setMode] = useState<ExportMode>("smart");
+  const [focusMode, setFocusMode] = useState<"auto" | "manual">("auto");
+  const [focus, setFocus] = useState({ x: 0.5, y: 0.5 });
+  const [zoom, setZoom] = useState(1);
+  const [trackSubject, setTrackSubject] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState("");
+  const [cacheMessage, setCacheMessage] = useState("");
+  const [width, height] = exportPresets[ratio][resolutionIndex];
+
+  function updateFocus(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.type === "pointermove" && event.buttons !== 1) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
+    setFocus({ x, y });
+    setFocusMode("manual");
+  }
+
+  async function downloadExport() {
+    setExporting(true);
+    setError("");
+    setCacheMessage("");
+    try {
+      const response = await fetch(`${API}/assets/${asset.id}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ratio, width, height, mode, focus_mode: focusMode,
+          focus_x: focus.x, focus_y: focus.y, zoom,
+          track_subject: asset.media_type === "video" && trackSubject,
+        }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.detail || "导出失败");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      const suffix = asset.media_type === "video" ? "mp4" : "jpg";
+      anchor.href = url;
+      anchor.download = `${asset.original_name.replace(/\.[^.]+$/, "")}_${ratio.replace(":", "x")}_${width}x${height}.${suffix}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setCacheMessage(response.headers.get("X-Export-Cache") === "hit" ? "已从缓存完成下载" : "导出完成，已加入缓存");
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : "导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const previewStyle: React.CSSProperties = mode === "contain"
+    ? { objectFit: "contain", objectPosition: "center" }
+    : { objectFit: "cover", objectPosition: `${focus.x * 100}% ${focus.y * 100}%`, transform: `scale(${zoom})` };
+
+  return (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/85 p-3 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget && !exporting) onClose(); }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="export-editor-title" className="flex max-h-[95vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-white/15 bg-[#0f141b] shadow-2xl">
+        <header className="flex items-center justify-between border-b border-white/10 px-5 py-4 sm:px-6">
+          <div><div className="text-[10px] font-semibold uppercase text-teal-400">下载版本</div><h2 id="export-editor-title" className="mt-1 text-lg font-semibold text-white">裁剪与安全框预览</h2></div>
+          <button type="button" onClick={onClose} disabled={exporting} aria-label="关闭导出编辑器" className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-xl text-slate-300 hover:bg-white/10 disabled:opacity-40">×</button>
+        </header>
+        <div className="grid min-h-0 flex-1 overflow-y-auto lg:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="flex min-h-[420px] items-center justify-center bg-black/35 p-5 sm:p-8">
+            <div className="relative max-h-[68vh] w-full max-w-3xl touch-none overflow-hidden bg-black shadow-2xl" style={{ aspectRatio: `${width} / ${height}`, maxWidth: height > width ? "min(100%, 430px)" : "100%" }} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); updateFocus(event); }} onPointerMove={updateFocus}>
+              {asset.media_type === "image"
+                ? <img src={absoluteUrl(asset.content_url)} alt="裁剪预览" draggable={false} className="pointer-events-none h-full w-full select-none transition-transform duration-150" style={previewStyle} />
+                : <video src={absoluteUrl(asset.content_url)} poster={absoluteUrl(asset.thumbnail_url)} controls preload="metadata" className="h-full w-full bg-black transition-transform duration-150" style={previewStyle} />}
+              <div className="pointer-events-none absolute inset-[7%] border border-dashed border-white/90 shadow-[0_0_0_999px_rgba(0,0,0,.12)]" aria-hidden="true" />
+              <div className="pointer-events-none absolute inset-[7%] grid grid-cols-3 grid-rows-3 opacity-35" aria-hidden="true">{Array.from({ length: 9 }).map((_, index) => <span key={index} className="border border-white/35" />)}</div>
+              {mode === "smart" && <div className="pointer-events-none absolute h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-teal-300 bg-teal-400/20 shadow" style={{ left: `${focus.x * 100}%`, top: `${focus.y * 100}%` }} />}
+            </div>
+          </div>
+          <aside className="border-t border-white/10 p-5 lg:border-l lg:border-t-0 lg:p-6">
+            <div className="mb-5"><div className="mb-2 text-xs font-medium text-slate-400">画面比例</div><div className="grid grid-cols-4 gap-2">{(Object.keys(exportPresets) as ExportRatio[]).map((value) => <button key={value} type="button" onClick={() => { setRatio(value); setResolutionIndex(0); }} className={`h-10 rounded-md border text-xs font-semibold ${ratio === value ? "border-teal-400 bg-teal-400/15 text-teal-300" : "border-white/10 text-slate-400 hover:bg-white/5"}`}>{value}</button>)}</div></div>
+            <div className="mb-5"><div className="mb-2 text-xs font-medium text-slate-400">分辨率</div><div className="grid grid-cols-2 gap-2">{exportPresets[ratio].map(([presetWidth, presetHeight], index) => <button key={`${presetWidth}x${presetHeight}`} type="button" onClick={() => setResolutionIndex(index)} className={`h-10 rounded-md border text-xs ${resolutionIndex === index ? "border-teal-400 bg-teal-400/15 text-teal-300" : "border-white/10 text-slate-400 hover:bg-white/5"}`}>{presetWidth} × {presetHeight}</button>)}</div></div>
+            <div className="mb-5"><div className="mb-2 text-xs font-medium text-slate-400">适配方式</div><div className="grid grid-cols-2 gap-2"><button type="button" onClick={() => setMode("smart")} className={`h-11 rounded-md border text-xs font-semibold ${mode === "smart" ? "border-teal-400 bg-teal-400/15 text-teal-300" : "border-white/10 text-slate-400"}`}>智能裁剪</button><button type="button" onClick={() => setMode("contain")} className={`h-11 rounded-md border text-xs font-semibold ${mode === "contain" ? "border-teal-400 bg-teal-400/15 text-teal-300" : "border-white/10 text-slate-400"}`}>完整显示</button></div></div>
+            {mode === "smart" && <div className="mb-5 space-y-4 rounded-lg border border-white/10 bg-white/[.025] p-4">
+              <div className="flex items-center justify-between"><span className="text-xs text-slate-400">焦点</span><button type="button" onClick={() => { setFocusMode("auto"); setFocus({ x: 0.5, y: 0.5 }); }} className={`rounded-md px-2.5 py-1 text-[11px] ${focusMode === "auto" ? "bg-teal-400/15 text-teal-300" : "bg-white/5 text-slate-400"}`}>{focusMode === "auto" ? "自动识别" : "恢复自动"}</button></div>
+              <label className="block text-xs text-slate-400">缩放 {zoom.toFixed(1)}×<input type="range" min="1" max="3" step="0.1" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} className="mt-2 w-full accent-teal-400" /></label>
+              {asset.media_type === "video" && <label className="flex cursor-pointer items-center justify-between gap-3 text-xs text-slate-400"><span>逐段动态跟踪</span><input type="checkbox" checked={trackSubject} onChange={(event) => setTrackSubject(event.target.checked)} className="h-4 w-4 accent-teal-400" /></label>}
+            </div>}
+            <div className="mb-5 rounded-lg border border-white/[.08] bg-black/20 px-3 py-2.5 text-[11px] leading-5 text-slate-500">虚线区域为安全框。拖动画面可改为手动焦点；完整显示会保留全部内容并使用黑色边缘填充。</div>
+            {error && <p className="mb-3 text-xs text-red-300">{error}</p>}
+            {cacheMessage && <p className="mb-3 text-xs text-emerald-300">{cacheMessage}</p>}
+            <button type="button" disabled={exporting} onClick={downloadExport} className="flex h-12 w-full items-center justify-center rounded-md bg-teal-400 text-sm font-semibold text-slate-950 transition hover:bg-teal-300 disabled:cursor-wait disabled:opacity-60">{exporting ? (asset.media_type === "video" ? "正在逐段分析并导出…" : "正在生成下载版本…") : `下载 ${width} × ${height}`}</button>
           </aside>
         </div>
       </section>
@@ -627,12 +857,12 @@ function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; on
           <div><div className="text-[10px] font-semibold uppercase text-teal-400">外部素材</div><h2 id="external-assets-title" className="mt-1 text-lg font-semibold text-white">从素材平台导入</h2></div>
           <button type="button" onClick={onClose} aria-label="关闭外部素材窗口" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-xl text-slate-300 hover:bg-white/10">×</button>
         </header>
-        <div className="flex gap-2 overflow-x-auto border-b border-white/10 px-5 pt-4 sm:px-6">{(Object.entries(providerText) as [ExternalProvider, string][]).map(([value, label]) => <button key={value} type="button" onClick={() => { setProvider(value); if (value === "unsplash" || value === "openverse") setMediaType("image"); setItems([]); setError(""); }} className={`shrink-0 border-b-2 px-3 pb-3 text-sm font-medium transition ${provider === value ? "border-teal-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300"}`}>{label}</button>)}</div>
+        <div className="flex gap-2 overflow-x-auto border-b border-white/10 px-5 pt-4 sm:px-6">{(Object.entries(providerText) as [ExternalProvider, string][]).map(([value, label]) => <button key={value} type="button" onClick={() => { setProvider(value); if (value === "unsplash" || value === "openverse") setMediaType("image"); if (value === "mixkit") setMediaType("video"); setItems([]); setError(""); }} className={`shrink-0 border-b-2 px-3 pb-3 text-sm font-medium transition ${provider === value ? "border-teal-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300"}`}>{label}</button>)}</div>
         <form onSubmit={searchExternal} className="flex flex-col gap-3 border-b border-white/10 p-5 sm:flex-row sm:p-6">
           <div className="flex shrink-0 rounded-lg border border-white/10 bg-black/20 p-1">
-            {([['image', '图片'], ['video', '视频']] as const).map(([value, label]) => <button key={value} type="button" disabled={(provider === "unsplash" || provider === "openverse") && value === "video"} onClick={() => { setMediaType(value); setItems([]); }} className={`h-9 px-4 text-xs disabled:cursor-not-allowed disabled:opacity-30 ${mediaType === value ? "rounded-md bg-teal-400 text-slate-950" : "text-slate-400"}`}>{label}</button>)}
+            {([['image', '图片'], ['video', '视频']] as const).map(([value, label]) => <button key={value} type="button" disabled={((provider === "unsplash" || provider === "openverse") && value === "video") || (provider === "mixkit" && value === "image")} onClick={() => { setMediaType(value); setItems([]); }} className={`h-9 px-4 text-xs disabled:cursor-not-allowed disabled:opacity-30 ${mediaType === value ? "rounded-md bg-teal-400 text-slate-950" : "text-slate-400"}`}>{label}</button>)}
           </div>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索 ${providerText[provider]}，例如：城市夜景、数据中心`} className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/[.055] px-4 py-2.5 text-sm text-white outline-none placeholder:text-slate-600 focus:border-teal-400/60" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={provider === "mixkit" ? "搜索 Mixkit，例如：city night、data center" : `搜索 ${providerText[provider]}，例如：城市夜景、数据中心`} className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/[.055] px-4 py-2.5 text-sm text-white outline-none placeholder:text-slate-600 focus:border-teal-400/60" />
           <button disabled={loading || !query.trim()} className="h-11 rounded-lg bg-teal-400 px-6 text-sm font-semibold text-slate-950 disabled:opacity-50">{loading ? "搜索中…" : "搜索"}</button>
         </form>
         {error && <div className="mx-5 mt-4 rounded-lg border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm text-red-300 sm:mx-6">{error}</div>}
@@ -642,7 +872,7 @@ function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; on
             const imported = importedIds.includes(item.external_id);
             const importing = importingId === item.external_id;
             return <article key={`${item.media_type}-${item.external_id}`} className="overflow-hidden rounded-lg border border-white/10 bg-white/[.035]">
-              <a href={item.source_page_url} target="_blank" rel="noreferrer" className="block aspect-video overflow-hidden bg-black/30"><img src={item.preview_url} alt={item.title} className="h-full w-full object-cover transition hover:scale-[1.02]" /></a>
+              <a href={item.source_page_url} target="_blank" rel="noreferrer" className="block overflow-hidden bg-black/30" style={{ aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : "16 / 9" }}><img src={item.preview_url} alt={item.title} className="h-full w-full object-contain transition hover:scale-[1.02]" /></a>
               <div className="p-3"><h3 title={item.title} className="truncate text-sm font-medium text-white">{item.title}</h3><p className="mt-1 truncate text-xs text-slate-500">作者：{item.author || `${providerText[item.provider]} 创作者`}</p>{item.license && <p className="mt-1 truncate text-[11px] text-emerald-400">许可：{item.license}</p>}
                 <button type="button" disabled={importing || imported || importingId !== null} onClick={() => importAsset(item)} className="mt-3 h-9 w-full rounded-md bg-teal-400/15 text-xs font-semibold text-teal-300 transition hover:bg-teal-400/25 disabled:opacity-50">{importing ? "正在下载…" : imported ? "已导入" : "导入素材库"}</button>
               </div>
