@@ -357,8 +357,8 @@ def list_assets(
         }
         assets.sort(key=lambda asset: (combined_scores[asset.id], asset.created_at), reverse=True)
         return AssetList(
-            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:10]],
-            total=min(len(assets), 10),
+            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:20]],
+            total=min(len(assets), 20),
             query_terms=query_terms,
         )
 
@@ -390,16 +390,33 @@ def unified_search(
     db: Session = Depends(get_db),
 ):
     """Search local assets and external providers without importing external files."""
-    local = list_assets(q=q, media_type=media_type, category=category, db=db)
-    local_items = [{"source": "local", "asset": item, "score": item.search_score or 0.0} for item in local.items[:10]]
     searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
+    provider_media = {
+        "pexels": {"image", "video"},
+        "pixabay": {"image", "video"},
+        "unsplash": {"image"},
+        "openverse": {"image"},
+        "mixkit": {"video"},
+    }
+    provider_order = {provider: index for index, provider in enumerate(searchers)}
     requested_types = [media_type] if media_type else ["image", "video"]
+    local_groups = {"image": [], "video": []}
+    query_terms = [q]
+    for requested_type in requested_types:
+        local = list_assets(q=q, media_type=requested_type, category=category, db=db)
+        local_groups[requested_type] = [
+            {"source": "local", "asset": item, "score": item.search_score or 0.0}
+            for item in local.items[:20]
+        ]
+        query_terms.extend(local.query_terms)
+
     external: list[dict] = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {
-            pool.submit(searcher, q.strip(), requested_type, 1, 10): (provider, requested_type)
+            pool.submit(searcher, q.strip(), requested_type, 1, 20): (provider, requested_type)
             for provider, searcher in searchers.items()
             for requested_type in requested_types
+            if requested_type in provider_media[provider]
         }
         for future in as_completed(futures):
             provider, _requested_type = futures[future]
@@ -413,23 +430,49 @@ def unified_search(
                 item["source"] = "external"
                 external.append(item)
     external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
-    try:
-        query_vector = embed_texts([q], query=True)[0]
-        texts = [" ".join(str(item.get(key) or "") for key in ("title", "author", "media_type")) for item in external]
-        vectors = embed_texts(texts)
-        for item, vector in zip(external, vectors, strict=True):
-            semantic_score = max(0.0, min(1.0, _cosine(query_vector, vector)))
-            rank_score = 1.0 - ((item["provider_rank"] - 1) / 9)
-            item["score"] = round(0.85 * semantic_score + 0.15 * rank_score, 6)
-    except Exception:
-        logger.warning("External embedding unavailable; using provider rank", exc_info=True)
-        for item in external:
-            item["score"] = round(1.0 - ((item["provider_rank"] - 1) / 9), 6)
-    external_items = [{"provider": item.pop("provider", None), **item} for item in external]
-    external_items.sort(key=lambda item: item["score"], reverse=True)
-    results = local_items + external_items[:20]
-    results.sort(key=lambda item: item["score"], reverse=True)
-    return {"items": results[:30], "total": min(len(results), 30), "query": q, "media_type": media_type}
+    external_images = [item for item in external if item.get("media_type") == "image"]
+    if external_images:
+        try:
+            query_vector = embed_texts([q], query=True)[0]
+            texts = [" ".join(str(item.get(key) or "") for key in ("title", "author", "media_type")) for item in external_images]
+            vectors = embed_texts(texts)
+            for item, vector in zip(external_images, vectors, strict=True):
+                semantic_score = max(0.0, min(1.0, _cosine(query_vector, vector)))
+                rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19))
+                item["score"] = round(0.85 * semantic_score + 0.15 * rank_score, 6)
+        except Exception:
+            logger.warning("External image embedding unavailable; using provider rank", exc_info=True)
+            for item in external_images:
+                item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
+        external_images.sort(key=lambda item: (item["score"], -provider_order[item["provider"]]), reverse=True)
+    external_image_items = [{"source": "external", **item} for item in external_images[:30]]
+
+    external_video_items = []
+    for provider in searchers:
+        provider_videos = [
+            item for item in external
+            if item.get("media_type") == "video" and item.get("provider") == provider
+        ]
+        for item in provider_videos[:10]:
+            rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 9))
+            external_video_items.append({"source": "external", **item, "score": round(rank_score, 6)})
+
+    groups = {
+        "image": {"local": local_groups["image"], "external": external_image_items},
+        "video": {"local": local_groups["video"], "external": external_video_items},
+    }
+    results = [
+        *groups["image"]["local"], *groups["image"]["external"],
+        *groups["video"]["local"], *groups["video"]["external"],
+    ]
+    return {
+        "items": results,
+        "groups": groups,
+        "total": len(results),
+        "query": q,
+        "query_terms": list(dict.fromkeys(query_terms)),
+        "media_type": media_type,
+    }
 
 
 @app.get("/api/assets/{asset_id}", response_model=AssetOut)

@@ -49,6 +49,7 @@ type Asset = {
   thumbnail_url: string | null;
   search_score?: number | null;
   external_provider?: ExternalProvider;
+  search_group?: "image-local" | "image-external" | "video-local" | "video-external";
 };
 
 type ExternalProvider = "pexels" | "pixabay" | "unsplash" | "openverse" | "mixkit";
@@ -131,19 +132,23 @@ export default function Home() {
 
   const loadAssets = useCallback(async (q = "") => {
     try {
-      const searchType = typeFilter === "image" || typeFilter === "video" ? `&media_type=${typeFilter}` : "";
-      const response = await fetch(q.trim() ? `${API}/search?q=${encodeURIComponent(q)}${searchType}` : `${API}/assets`, { cache: "no-store" });
+      const response = await fetch(q.trim() ? `${API}/search?q=${encodeURIComponent(q)}` : `${API}/assets`, { cache: "no-store" });
       if (!response.ok) throw new Error("无法加载素材列表");
       const data = await response.json();
-      const nextAssets: Asset[] = q.trim() ? data.items.map((item: any) => item.source === "local" ? item.asset : ({
-        id: `external:${item.provider}:${item.external_id}`, original_name: item.title, media_type: item.media_type,
-        mime_type: item.media_type === "video" ? "video/mp4" : "image/jpeg", file_size: 0, width: item.width, height: item.height,
-        duration: item.duration ?? null, media_metadata: {}, status: "ready", description: `${item.provider} external asset`,
-        scene: "External", tags: [item.provider], category: "External", categories: ["External"], error_message: null,
-        source_type: "external", source_id: item.external_id, source_page_url: item.source_page_url, source_author: item.author,
-        source_license: item.license, created_at: new Date().toISOString(), content_url: item.preview_url,
-        thumbnail_url: item.preview_url, search_score: item.score, external_provider: item.provider,
-      })) : data.items;
+      const nextAssets: Asset[] = q.trim() ? data.items.map((item: any) => {
+        const source = item.source === "local" ? "local" : "external";
+        const mediaType = item.source === "local" ? item.asset.media_type : item.media_type;
+        const searchGroup = `${mediaType}-${source}` as Asset["search_group"];
+        return item.source === "local" ? { ...item.asset, search_group: searchGroup } : ({
+          id: `external:${item.provider}:${item.external_id}`, original_name: item.title, media_type: item.media_type,
+          mime_type: item.media_type === "video" ? "video/mp4" : "image/jpeg", file_size: 0, width: item.width, height: item.height,
+          duration: item.duration ?? null, media_metadata: {}, status: "ready", description: `${providerText[item.provider as ExternalProvider]} 外部素材`,
+          scene: "External", tags: [item.provider], category: "External", categories: ["External"], error_message: null,
+          source_type: "external", source_id: item.external_id, source_page_url: item.source_page_url, source_author: item.author,
+          source_license: item.license, created_at: new Date().toISOString(), content_url: item.preview_url,
+          thumbnail_url: item.preview_url, search_score: item.score, external_provider: item.provider, search_group: searchGroup,
+        });
+      }) : data.items;
       setAssets(nextAssets);
       setQueryTerms(data.query_terms ?? []);
       setUploadItems((items) => items.map((item) => {
@@ -157,7 +162,7 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }, [typeFilter]);
+  }, []);
 
   useEffect(() => { loadAssets(); }, [loadAssets]);
 
@@ -424,6 +429,24 @@ export default function Home() {
   const availableCategories = Array.from(new Set(assets.flatMap((asset) => asset.categories?.length ? asset.categories : [asset.category || "其他"]))).sort();
   const visibleAssetIds = Array.from(new Set(visibleAssets.filter((asset) => asset.source_type !== "external").map((asset) => asset.id)));
   const allVisibleSelected = visibleAssetIds.length > 0 && visibleAssetIds.every((id) => selectedIds.has(id));
+  const isSearchResults = assets.some((asset) => asset.search_group !== undefined);
+  const browseSections = Object.entries(visibleAssets.reduce<Record<string, Asset[]>>((groups, asset) => {
+    const sections = categoryFilter === "all" ? (asset.categories?.length ? asset.categories : [asset.category || "其他"]) : [categoryFilter];
+    sections.forEach((section) => (groups[section] ||= []).push(asset));
+    return groups;
+  }, {})).map(([title, sectionAssets]) => ({ key: `category-${title}`, title, eyebrow: "主题板块", assets: sectionAssets, mediaHeader: null as string | null }));
+  const searchSections = (["image", "video"] as const).flatMap((mediaType) => {
+    const sections = (["local", "external"] as const).map((source) => ({
+      key: `${mediaType}-${source}`,
+      title: source === "local" ? "内部资源" : "外部资源",
+      eyebrow: source === "local" ? "本地素材库" : "开放素材平台",
+      assets: visibleAssets.filter((asset) => asset.search_group === `${mediaType}-${source}`),
+      mediaHeader: null as string | null,
+    })).filter((section) => section.assets.length > 0);
+    if (sections.length) sections[0].mediaHeader = mediaType === "image" ? "图片" : "视频";
+    return sections;
+  });
+  const displaySections = isSearchResults ? searchSections : browseSections;
 
   function toggleAllVisible() {
     setSelectedIds((current) => {
@@ -504,10 +527,10 @@ export default function Home() {
       </section>
       {queryTerms.length > 1 && <div className="-mt-4 mb-6 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-600"><span>素材相关扩展：</span>{queryTerms.slice(1).map((term) => <button type="button" key={term} aria-label={`搜索 ${term}`} onClick={() => { setQuery(term); setLoading(true); loadAssets(term); }} className="rounded-full border border-white/[.07] px-2 py-1 text-slate-500 transition hover:border-teal-400/30 hover:bg-teal-400/10 hover:text-teal-300">{term}</button>)}</div>}
 
-      <section className="mb-6 flex items-center gap-3 overflow-x-auto pb-1 text-xs">
+      {!isSearchResults && <section className="mb-6 flex items-center gap-3 overflow-x-auto pb-1 text-xs">
         <span className="shrink-0 text-slate-600">题材分类</span>
         {["all", ...availableCategories].map((value) => <button key={value} type="button" onClick={() => setCategoryFilter(value)} className={`shrink-0 rounded-full border px-3 py-1.5 transition ${categoryFilter === value ? "border-teal-400/30 bg-teal-400/15 text-teal-300" : "border-white/10 bg-white/[.025] text-slate-500 hover:text-slate-300"}`}>{value === "all" ? "全部题材" : value}</button>)}
-      </section>
+      </section>}
 
       {visibleAssetIds.length > 0 && <section className="mb-6 flex flex-wrap items-center justify-between gap-3 border-y border-white/10 py-3">
         <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
@@ -533,10 +556,11 @@ export default function Home() {
         </div>
       ) : (
         <div className="space-y-9">
-          {Object.entries(visibleAssets.reduce<Record<string, Asset[]>>((groups, asset) => { const sections = categoryFilter === "all" ? (asset.categories?.length ? asset.categories : [asset.category || "其他"]) : [categoryFilter]; sections.forEach((section) => (groups[section] ||= []).push(asset)); return groups; }, {})).map(([section, sectionAssets]) => <section key={section}>
-            <header className="mb-4 flex items-center justify-between border-b border-white/10 pb-3"><div><span className="text-[10px] font-semibold uppercase tracking-[.2em] text-teal-400">主题板块</span><h2 className="mt-1 text-lg font-semibold text-white">{section}</h2></div><span className="text-xs text-slate-500">{sectionAssets.length} 项素材</span></header>
+          {displaySections.map((section) => <section key={section.key}>
+            {section.mediaHeader && <header className="mb-5 border-b border-teal-400/25 pb-3"><h2 className="text-2xl font-semibold text-white">{section.mediaHeader}</h2></header>}
+            <header className="mb-4 flex items-center justify-between border-b border-white/10 pb-3"><div><span className="text-[10px] font-semibold uppercase tracking-[.2em] text-teal-400">{section.eyebrow}</span><h3 className="mt-1 text-lg font-semibold text-white">{section.title}</h3></div><span className="text-xs text-slate-500">{section.assets.length} 项素材</span></header>
             <div className="grid items-start gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {sectionAssets.map((asset) => (
+          {section.assets.map((asset) => (
             <article key={asset.id} role="button" tabIndex={0} aria-label={`查看 ${asset.original_name} 详情`} onClick={() => setSelectedAsset(asset)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAsset(asset); }} className="cursor-pointer overflow-hidden rounded-2xl border border-white/10 bg-[#11161e]/90 shadow-2xl shadow-black/20 transition hover:-translate-y-0.5 hover:border-teal-400/30 focus:outline-none focus:ring-2 focus:ring-teal-400/60">
               <div className="relative overflow-hidden bg-slate-900" style={{ aspectRatio: asset.width && asset.height ? `${asset.width} / ${asset.height}` : "16 / 9" }}>
                 {asset.source_type !== "external" && <label className="absolute bottom-2.5 left-2.5 z-10 flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-white/20 bg-black/70 backdrop-blur" onClick={(event) => event.stopPropagation()}>
@@ -545,7 +569,7 @@ export default function Home() {
                 {asset.media_type !== "audio" && (asset.thumbnail_url || asset.content_url) && <img loading="lazy" decoding="async" src={absoluteUrl(asset.thumbnail_url || asset.content_url)} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} className="h-full w-full object-contain" />}
                 {asset.media_type === "audio" && <div className="flex h-full items-center justify-center bg-gradient-to-br from-violet-950 to-slate-950"><div className="flex h-20 w-20 items-center justify-center rounded-full border border-violet-300/20 bg-violet-400/10 text-4xl text-violet-300">♫</div></div>}
                 <div className="absolute left-3 top-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-white/80 backdrop-blur">{mediaText[asset.media_type] ?? asset.media_type}</div>
-                {asset.search_score !== null && asset.search_score !== undefined && <div className="absolute left-3 top-11 rounded-md border border-teal-300/25 bg-teal-950/80 px-2 py-1 text-[10px] font-semibold text-teal-200 backdrop-blur">相关度 {(asset.search_score * 100).toFixed(0)}%</div>}
+                {asset.search_score !== null && asset.search_score !== undefined && <div className="absolute left-3 top-11 rounded-md border border-teal-300/25 bg-teal-950/80 px-2 py-1 text-[10px] font-semibold text-teal-200 backdrop-blur">{asset.search_group === "video-external" ? "平台排名" : "相关度"} {(asset.search_score * 100).toFixed(0)}%</div>}
                 <div className={`absolute right-3 top-3 rounded-full border px-2.5 py-1 text-[11px] font-medium backdrop-blur ${asset.status === "ready" ? "border-emerald-300/30 bg-emerald-950/70 text-emerald-300" : asset.status === "failed" ? "border-red-300/30 bg-red-950/70 text-red-300" : "border-amber-300/30 bg-amber-950/70 text-amber-200"}`}>{statusText[asset.status]}</div>
                 {asset.source_type !== "external" && <button type="button" aria-label={`删除 ${asset.original_name}`} onClick={(event) => { event.stopPropagation(); setDeleteTarget(asset); }} className="absolute bottom-2.5 right-2.5 flex h-8 w-8 items-center justify-center rounded-lg border border-red-300/20 bg-black/65 text-sm text-red-300 opacity-80 backdrop-blur transition hover:bg-red-500/25 hover:opacity-100">⌫</button>}
               </div>

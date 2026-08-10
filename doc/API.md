@@ -45,11 +45,11 @@ curl -X POST http://localhost:8000/api/assets/upload -F "file=@./sample.jpg"
 
 ### `GET /api/search`
 
-前端有搜索词时使用。统一检索本地素材和外部素材：本地最多 10 条，外部最多 20 条，合并后按得分降序返回，最多 30 条。前端选择“图片”或“视频”时传对应的 `media_type`；选择“全部”时不传该参数，同时检索图片和视频。Pexels、Pixabay、Unsplash 支持视频，Openverse 仅支持图片。
+前端有搜索词时使用。结果按图片/视频、内部/外部分成四组，内部图片和内部视频分别按本地综合得分返回前 20 条。外部图片从每个平台最多召回 20 条，跨平台评分后返回前 30 条；外部视频不做项目侧语义重排，每个支持视频的平台保留其站内顺序并返回前 10 条。Pexels、Pixabay 支持图片和视频，Unsplash、Openverse 仅支持图片，Mixkit 仅支持视频。
 
 参数：`q`（必填）、`media_type`（可选，`image` 或 `video`；不传时同时检索图片和视频）、`category`（可选）。
 
-返回项的 `source` 为 `local` 时包含 `asset`；为 `external` 时包含 `provider`、`external_id`、`title`、`preview_url`、`source_page_url`、`score` 等字段。
+响应通过 `groups.image.local`、`groups.image.external`、`groups.video.local`、`groups.video.external` 提供四组结果，同时保留扁平 `items` 兼容字段。返回项的 `source` 为 `local` 时包含 `asset`；为 `external` 时包含 `provider`、`external_id`、`title`、`preview_url`、`source_page_url`、`score` 等字段。
 
 ### `GET /api/assets/{asset_id}`
 
