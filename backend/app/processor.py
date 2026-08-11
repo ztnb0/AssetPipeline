@@ -11,7 +11,7 @@ from .analyzer import analyze_image, analyze_images
 from .audio_analyzer import analyze_audio
 from .database import SessionLocal
 from .models import Asset, AssetStatus
-from .storage import get_object, move_object, put_bytes
+from .storage import download_file, get_object, move_object, put_bytes, upload_file
 from .vector_store import safe_index_asset
 
 
@@ -20,8 +20,8 @@ from .vector_store import safe_index_asset
 ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(2)
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(command, capture_output=True, check=True, timeout=120)
+def _run(command: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(command, capture_output=True, check=True, timeout=timeout)
 
 
 def _probe(path: Path) -> dict:
@@ -84,18 +84,25 @@ def _process_image(asset: Asset, original: bytes) -> None:
     asset.category = asset.categories[0] if asset.categories else "其他"
 
 
-def _process_video(asset: Asset, original: bytes) -> None:
-    suffix = Path(asset.original_name).suffix or ".mp4"
-    with tempfile.TemporaryDirectory() as temp_dir:
-        source = Path(temp_dir) / f"source{suffix}"
-        source.write_bytes(original)
-        probe = _probe(source)
-        asset.duration = _number(probe.get("format", {}).get("duration"), 0.0)
-        video_stream = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"), {})
-        asset.width = video_stream.get("width")
-        asset.height = video_stream.get("height")
-        asset.media_metadata = _media_metadata(probe)
-        frames, frame_times = _video_frames(source, asset.duration or 0.0)
+def _process_video(asset: Asset, source: Path) -> None:
+    probe = _probe(source)
+    asset.duration = _number(probe.get("format", {}).get("duration"), 0.0)
+    video_stream = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"), {})
+    asset.width = video_stream.get("width")
+    asset.height = video_stream.get("height")
+    frames, frame_times = _video_frames(source, asset.duration or 0.0)
+    proxy = source.parent / "preview.mp4"
+    _run([
+        "ffmpeg", "-y", "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", "scale='min(1920,iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart", str(proxy),
+    ], timeout=900)
+    preview_key = f"previews/{asset.id}.mp4"
+    upload_file(preview_key, str(proxy), "video/mp4")
+    asset.media_metadata = {**_media_metadata(probe), "preview_key": preview_key, "preview_size": proxy.stat().st_size}
     asset.thumbnail_key = f"thumbnails/{asset.id}.jpg"
     put_bytes(asset.thumbnail_key, frames[0], "image/jpeg")
     analysis = analyze_images([(frame, "image/jpeg") for frame in frames], frame_times=frame_times, asset_context=f"视频文件名：{asset.original_name}；时长：{asset.duration:.2f} 秒")
@@ -161,13 +168,19 @@ def _process_asset(asset_id: str) -> None:
         db.close()
         return
     try:
-        response = get_object(asset.object_key)
-        original = response["Body"].read()
         if asset.media_type == "image":
+            response = get_object(asset.object_key)
+            original = response["Body"].read()
             _process_image(asset, original)
         elif asset.media_type == "video":
-            _process_video(asset, original)
+            suffix = Path(asset.object_key).suffix or ".video"
+            with tempfile.TemporaryDirectory() as temp_dir:
+                source = Path(temp_dir) / f"source{suffix}"
+                download_file(asset.object_key, str(source))
+                _process_video(asset, source)
         elif asset.media_type == "audio":
+            response = get_object(asset.object_key)
+            original = response["Body"].read()
             _process_audio(asset, original)
         else:
             raise ValueError(f"不支持的媒体类型：{asset.media_type}")

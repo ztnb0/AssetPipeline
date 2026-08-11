@@ -14,6 +14,13 @@ class AssetStatus(str, enum.Enum):
     failed = "failed"
 
 
+class ImportJobStatus(str, enum.Enum):
+    queued = "queued"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
 class Asset(Base):
     __tablename__ = "assets"
 
@@ -42,5 +49,23 @@ class Asset(Base):
     source_license: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ImportJob(Base):
+    __tablename__ = "import_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider: Mapped[str] = mapped_column(String(30), index=True)
+    external_id: Mapped[str] = mapped_column(String(100), index=True)
+    media_type: Mapped[str] = mapped_column(String(30))
+    status: Mapped[ImportJobStatus] = mapped_column(Enum(ImportJobStatus), default=ImportJobStatus.queued, index=True)
+    stage: Mapped[str] = mapped_column(String(30), default="queued")
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

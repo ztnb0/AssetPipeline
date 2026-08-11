@@ -48,6 +48,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
         "media_type": "image",
         "title": item.get("title") or f"Openverse 图片 {item['id']}",
         "preview_url": item.get("thumbnail", ""),
+        "preview_content_url": item.get("url") or item.get("thumbnail", ""),
         "author": item.get("creator") or "",
         "source_page_url": item.get("foreign_landing_url") or item.get("detail_url") or "",
         "width": item.get("width"),

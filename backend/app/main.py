@@ -3,28 +3,49 @@ import logging
 import threading
 import time
 import uuid
+import re
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from botocore.exceptions import ClientError
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .database import Base, engine, get_db, migrate_demo_schema
-from .models import Asset, AssetStatus
+from .database import Base, SessionLocal, engine, get_db, migrate_demo_schema
+from .models import Asset, AssetStatus, ImportJob, ImportJobStatus
 from .fred import FredError, generate_chart as generate_fred_chart, list_series as list_fred_series
+from .ibaotu import IbaotuError, search as search_ibaotu
+from .import_jobs import run_ibaotu_import
 from .openverse import OpenverseError, download as download_openverse, get_download as get_openverse_download, search as search_openverse
 from .pexels import PexelsError, download as download_pexels, get_download as get_pexels_download, search as search_pexels
 from .pixabay import PixabayError, download as download_pixabay, get_download as get_pixabay_download, search as search_pixabay
 from .processor import process_asset
-from .schemas import AssetList, AssetOut, AssetUpdate, ExternalAssetImport, ExternalAssetList, FredChartCreate
+from .media_export import export_asset
+from .mixkit import MixkitError, download as download_mixkit, get_download as get_mixkit_download, get_preview as get_mixkit_preview, search as search_mixkit
+from .schemas import (
+    AssetBatchDelete,
+    AssetBatchDeleteResult,
+    AssetExportRequest,
+    AssetList,
+    AssetOut,
+    AssetUpdate,
+    ExternalAssetImport,
+    ExternalAssetList,
+    ExternalAssetPreviewOut,
+    ImportJobOut,
+    FredChartCreate,
+)
 from .semantic import expand_from_assets, expand_query
-from .storage import delete_object, ensure_bucket, get_object, move_object, put_bytes
+from .storage import delete_object, delete_prefix, ensure_bucket, get_object, move_object, put_bytes
 from .unsplash import UnsplashError, download as download_unsplash, get_download as get_unsplash_download, search as search_unsplash
-from .vector_store import reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
+from .vector_store import embed_texts, reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
 
 
 ALLOWED_TYPES = {
@@ -41,6 +62,7 @@ EXTENSION_TYPES = {
     ".ogg": ("audio", "audio/ogg"),
 }
 logger = logging.getLogger(__name__)
+FORMAT_EXPORT_ENABLED = False
 
 
 @asynccontextmanager
@@ -58,6 +80,20 @@ async def lifespan(_: FastAPI):
             time.sleep(2)
     if last_error:
         raise last_error
+    recovery_db = SessionLocal()
+    try:
+        pending_jobs = recovery_db.scalars(select(ImportJob).where(
+            ImportJob.status.in_((ImportJobStatus.queued, ImportJobStatus.running))
+        )).all()
+        for job in pending_jobs:
+            threading.Thread(
+                target=run_ibaotu_import,
+                args=(job.id,),
+                daemon=True,
+                name=f"import-recovery-{job.id[:8]}",
+            ).start()
+    finally:
+        recovery_db.close()
     threading.Thread(target=reindex_ready_assets, daemon=True, name="vector-index-sync").start()
     yield
 
@@ -163,6 +199,8 @@ async def upload_asset(
     fallback = EXTENSION_TYPES.get(suffix)
     media_type = ALLOWED_TYPES.get(file.content_type or "") or (fallback[0] if fallback else None)
     mime_type = file.content_type if file.content_type in ALLOWED_TYPES else (fallback[1] if fallback else "")
+    if media_type == "audio":
+        raise HTTPException(410, "音频接口暂时停用")
     if not media_type:
         raise HTTPException(415, "支持 JPG、PNG、WebP、MP4、MOV、MKV、WebM、MP3、WAV、M4A、FLAC 和 OGG")
     data = await file.read()
@@ -180,19 +218,40 @@ async def upload_asset(
 @app.get("/api/external-assets/search", response_model=ExternalAssetList)
 def search_external_assets(
     q: str = Query(min_length=1, max_length=100),
-    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse)$"),
+    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit|ibaotu)$"),
     media_type: str = Query(default="image", pattern="^(image|video)$"),
     page: int = Query(default=1, ge=1, le=100),
     per_page: int = Query(default=12, ge=1, le=40),
 ):
     try:
-        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse}
+        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
         return searchers[provider](q.strip(), media_type, page, per_page)
-    except (PexelsError, PixabayError, UnsplashError, OpenverseError) as exc:
+    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError, IbaotuError) as exc:
         raise HTTPException(503, str(exc)) from exc
 
 
-@app.post("/api/external-assets/import", response_model=AssetOut, status_code=202)
+@app.get("/api/external-assets/preview", response_model=ExternalAssetPreviewOut)
+def external_asset_preview(
+    provider: str = Query(pattern="^mixkit$"),
+    external_id: str = Query(min_length=1, max_length=100),
+    media_type: str = Query(pattern="^video$"),
+):
+    try:
+        preview = get_mixkit_preview(external_id, media_type)
+    except MixkitError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return ExternalAssetPreviewOut(
+        provider=provider,
+        external_id=external_id,
+        media_type=media_type,
+        preview_content_url=preview["url"],
+        mime_type="video/mp4",
+        width=preview.get("width"),
+        height=preview.get("height"),
+    )
+
+
+@app.post("/api/external-assets/import", response_model=AssetOut | ImportJobOut, status_code=202)
 def import_external_asset(
     payload: ExternalAssetImport,
     background_tasks: BackgroundTasks,
@@ -202,21 +261,44 @@ def import_external_asset(
         Asset.source_type == payload.provider,
         Asset.source_id == payload.external_id,
     ))
-    if existing:
+    if existing and payload.provider == "ibaotu" and (existing.source_metadata or {}).get("licensed_media_filename"):
+        if existing.media_type == "video" and not (existing.media_metadata or {}).get("preview_key"):
+            existing.status = AssetStatus.processing
+            db.commit()
+            background_tasks.add_task(process_asset, existing.id)
         return serialize(existing)
+    if existing and (
+        payload.provider != "ibaotu"
+    ):
+        return serialize(existing)
+    if payload.provider == "ibaotu":
+        active = db.scalar(select(ImportJob).where(
+            ImportJob.provider == "ibaotu",
+            ImportJob.external_id == payload.external_id,
+            ImportJob.status.in_((ImportJobStatus.queued, ImportJobStatus.running)),
+        ).order_by(ImportJob.created_at.desc()))
+        if active:
+            return active
+        job = ImportJob(provider="ibaotu", external_id=payload.external_id, media_type=payload.media_type)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        background_tasks.add_task(run_ibaotu_import, job.id)
+        return job
     try:
         providers = {
             "pexels": (get_pexels_download, download_pexels, PexelsError, "Pexels License"),
             "pixabay": (get_pixabay_download, download_pixabay, PixabayError, "Pixabay Content License"),
             "unsplash": (get_unsplash_download, download_unsplash, UnsplashError, "Unsplash License"),
             "openverse": (get_openverse_download, download_openverse, OpenverseError, None),
+            "mixkit": (get_mixkit_download, download_mixkit, MixkitError, "Mixkit Stock Video Free License"),
         }
         get_download, download, error_type, license_name = providers[payload.provider]
         source = get_download(payload.external_id, payload.media_type)
         if not source.get("url"):
             raise error_type("该素材没有可用下载地址")
         data = download(source["url"], settings.max_upload_mb * 1024 * 1024)
-    except (PexelsError, PixabayError, UnsplashError, OpenverseError) as exc:
+    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
     asset = _create_asset(
@@ -233,9 +315,17 @@ def import_external_asset(
     return serialize(asset)
 
 
+@app.get("/api/external-assets/import-jobs/{job_id}", response_model=ImportJobOut)
+def get_import_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(ImportJob, job_id)
+    if not job:
+        raise HTTPException(404, "导入任务不存在")
+    return job
+
+
 @app.get("/api/fred/series")
 def fred_series():
-    return {"items": list_fred_series()}
+    raise HTTPException(410, "财经图表接口暂时停用")
 
 
 @app.post("/api/fred/charts", response_model=AssetOut, status_code=202)
@@ -244,6 +334,7 @@ def create_fred_chart(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    raise HTTPException(410, "财经图表接口暂时停用")
     try:
         chart = generate_fred_chart(payload.series_id, payload.years)
     except FredError as exc:
@@ -274,8 +365,12 @@ def list_assets(
 ):
     base_filters = []
     query_terms = []
+    if media_type == "audio":
+        raise HTTPException(410, "音频接口暂时停用")
     if media_type:
         base_filters.append(Asset.media_type == media_type)
+    elif q.strip():
+        base_filters.append(Asset.media_type.in_(("image", "video")))
     if category:
         base_filters.append(cast(Asset.categories, String).like(f'%"{category}"%'))
 
@@ -332,8 +427,8 @@ def list_assets(
         }
         assets.sort(key=lambda asset: (combined_scores[asset.id], asset.created_at), reverse=True)
         return AssetList(
-            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:100]],
-            total=len(assets),
+            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:20]],
+            total=min(len(assets), 20),
             query_terms=query_terms,
         )
 
@@ -344,6 +439,113 @@ def list_assets(
     return AssetList(items=[serialize(item) for item in items], total=total, query_terms=query_terms)
 
 
+def _normalized_page_url(url: str) -> str:
+    value = (url or "").strip().lower().split("#", 1)[0]
+    value = re.sub(r"[?&](utm_[^=&]+|fbclid|gclid)=[^&]*", "", value)
+    return value.rstrip("/?")
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    norm_left = math.sqrt(sum(value * value for value in left))
+    norm_right = math.sqrt(sum(value * value for value in right))
+    return dot / (norm_left * norm_right) if norm_left and norm_right else 0.0
+
+
+@app.get("/api/search")
+def unified_search(
+    q: str = Query(min_length=1, max_length=100),
+    media_type: str | None = Query(default=None, pattern="^(image|video)$"),
+    category: str | None = Query(default=None, max_length=80),
+    db: Session = Depends(get_db),
+):
+    """Search local assets and external providers without importing external files."""
+    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
+    provider_media = {
+        "pexels": {"image", "video"},
+        "pixabay": {"image", "video"},
+        "unsplash": {"image"},
+        "openverse": {"image"},
+        "mixkit": {"video"},
+        "ibaotu": {"image", "video"},
+    }
+    provider_order = {provider: index for index, provider in enumerate(searchers)}
+    requested_types = [media_type] if media_type else ["image", "video"]
+    local_groups = {"image": [], "video": []}
+    query_terms = [q]
+    for requested_type in requested_types:
+        local = list_assets(q=q, media_type=requested_type, category=category, db=db)
+        local_groups[requested_type] = [
+            {"source": "local", "asset": item, "score": item.search_score or 0.0}
+            for item in local.items[:20]
+        ]
+        query_terms.extend(local.query_terms)
+
+    external: list[dict] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(searcher, q.strip(), requested_type, 1, 20): (provider, requested_type)
+            for provider, searcher in searchers.items()
+            for requested_type in requested_types
+            if requested_type in provider_media[provider]
+        }
+        for future in as_completed(futures):
+            provider, _requested_type = futures[future]
+            try:
+                result = future.result()
+            except Exception:
+                logger.warning("External search failed for %s", provider, exc_info=True)
+                continue
+            for rank, item in enumerate(result.get("items", []), start=1):
+                item = {**item, "provider_rank": rank}
+                item["source"] = "external"
+                external.append(item)
+    external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
+    external_images = [item for item in external if item.get("media_type") == "image"]
+    if external_images:
+        try:
+            query_vector = embed_texts([q], query=True)[0]
+            texts = [" ".join(str(item.get(key) or "") for key in ("title", "author", "media_type")) for item in external_images]
+            vectors = embed_texts(texts)
+            for item, vector in zip(external_images, vectors, strict=True):
+                semantic_score = max(0.0, min(1.0, _cosine(query_vector, vector)))
+                rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19))
+                item["score"] = round(0.85 * semantic_score + 0.15 * rank_score, 6)
+        except Exception:
+            logger.warning("External image embedding unavailable; using provider rank", exc_info=True)
+            for item in external_images:
+                item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
+        external_images.sort(key=lambda item: (item["score"], -provider_order[item["provider"]]), reverse=True)
+    external_image_items = [{"source": "external", **item} for item in external_images[:30]]
+
+    external_video_items = []
+    for provider in searchers:
+        provider_videos = [
+            item for item in external
+            if item.get("media_type") == "video" and item.get("provider") == provider
+        ]
+        for item in provider_videos[:10]:
+            rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 9))
+            external_video_items.append({"source": "external", **item, "score": round(rank_score, 6)})
+
+    groups = {
+        "image": {"local": local_groups["image"], "external": external_image_items},
+        "video": {"local": local_groups["video"], "external": external_video_items},
+    }
+    results = [
+        *groups["image"]["local"], *groups["image"]["external"],
+        *groups["video"]["local"], *groups["video"]["external"],
+    ]
+    return {
+        "items": results,
+        "groups": groups,
+        "total": len(results),
+        "query": q,
+        "query_terms": list(dict.fromkeys(query_terms)),
+        "media_type": media_type,
+    }
+
+
 @app.get("/api/assets/{asset_id}", response_model=AssetOut)
 def get_asset(asset_id: str, db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
@@ -352,19 +554,36 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
     return serialize(asset)
 
 
-def stream_key(key: str):
-    response = get_object(key)
+def stream_key(key: str, headers: dict[str, str] | None = None, range_header: str | None = None):
+    try:
+        response = get_object(key, range_header)
+    except ClientError as exc:
+        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 416:
+            raise HTTPException(416, "请求的视频范围无效") from exc
+        raise
+    response_headers = {
+        **(headers or {}),
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(response.get("ContentLength", 0)),
+    }
+    if response.get("ContentRange"):
+        response_headers["Content-Range"] = response["ContentRange"]
     return StreamingResponse(
-        response["Body"].iter_chunks(), media_type=response.get("ContentType", "application/octet-stream")
+        response["Body"].iter_chunks(),
+        media_type=response.get("ContentType", "application/octet-stream"),
+        headers=response_headers,
+        status_code=206 if response.get("ContentRange") else 200,
     )
 
 
 @app.get("/api/assets/{asset_id}/content")
-def asset_content(asset_id: str, db: Session = Depends(get_db)):
+def asset_content(asset_id: str, range_header: str | None = Header(default=None, alias="Range"), db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
     if not asset:
         raise HTTPException(404, "素材不存在")
-    return stream_key(asset.object_key)
+    metadata = asset.media_metadata or {}
+    preview_key = metadata.get("preview_key") if asset.media_type == "video" else None
+    return stream_key(preview_key or asset.object_key, range_header=range_header)
 
 
 @app.get("/api/assets/{asset_id}/thumbnail")
@@ -373,6 +592,30 @@ def asset_thumbnail(asset_id: str, db: Session = Depends(get_db)):
     if not asset or not asset.thumbnail_key:
         raise HTTPException(404, "缩略图不存在")
     return stream_key(asset.thumbnail_key)
+
+
+@app.post("/api/assets/{asset_id}/export")
+def export_asset_download(asset_id: str, payload: AssetExportRequest, db: Session = Depends(get_db)):
+    if not FORMAT_EXPORT_ENABLED:
+        raise HTTPException(410, "比例裁剪下载功能暂未开放")
+    asset = db.get(Asset, asset_id)
+    if not asset:
+        raise HTTPException(404, "素材不存在")
+    if asset.status != AssetStatus.ready:
+        raise HTTPException(409, "素材尚未处理完成")
+    if asset.media_type not in {"image", "video"}:
+        raise HTTPException(415, "仅图片和视频支持比例导出")
+    try:
+        key, _content_type, filename, cache_hit = export_asset(asset, payload)
+    except (RuntimeError, ValueError) as exc:
+        logger.exception("Unable to export asset %s", asset_id)
+        raise HTTPException(422, str(exc)) from exc
+    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return stream_key(key, {
+        "Content-Disposition": disposition,
+        "X-Export-Cache": "hit" if cache_hit else "miss",
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Export-Cache",
+    })
 
 
 @app.post("/api/assets/{asset_id}/reanalyze", response_model=AssetOut, status_code=202)
@@ -437,14 +680,49 @@ def update_asset(asset_id: str, payload: AssetUpdate, db: Session = Depends(get_
     return serialize(asset)
 
 
+def _remove_asset(asset: Asset, db: Session) -> None:
+    delete_object(asset.object_key)
+    if asset.thumbnail_key:
+        delete_object(asset.thumbnail_key)
+    preview_key = (asset.media_metadata or {}).get("preview_key")
+    if preview_key:
+        delete_object(preview_key)
+    source_metadata = asset.source_metadata or {}
+    if source_metadata.get("source_file_key"):
+        delete_object(source_metadata["source_file_key"])
+    delete_prefix(f"exports/{asset.id}/")
+    db.delete(asset)
+    db.commit()
+    safe_delete_asset_vector(asset.id)
+
+
+@app.delete("/api/assets/batch", response_model=AssetBatchDeleteResult)
+def remove_assets(payload: AssetBatchDelete, db: Session = Depends(get_db)):
+    asset_ids = list(dict.fromkeys(payload.ids))
+    assets = {
+        asset.id: asset
+        for asset in db.scalars(select(Asset).where(Asset.id.in_(asset_ids))).all()
+    }
+    deleted_ids = []
+    failed = {}
+    for asset_id in asset_ids:
+        asset = assets.get(asset_id)
+        if not asset:
+            failed[asset_id] = "素材不存在"
+            continue
+        try:
+            _remove_asset(asset, db)
+            deleted_ids.append(asset_id)
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Unable to delete asset %s", asset_id)
+            failed[asset_id] = str(exc)[:500] or "删除失败"
+    return AssetBatchDeleteResult(deleted_ids=deleted_ids, failed=failed)
+
+
 @app.delete("/api/assets/{asset_id}", status_code=204)
 def remove_asset(asset_id: str, db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
     if not asset:
         raise HTTPException(404, "素材不存在")
-    delete_object(asset.object_key)
-    if asset.thumbnail_key:
-        delete_object(asset.thumbnail_key)
-    db.delete(asset)
-    db.commit()
-    safe_delete_asset_vector(asset_id)
+    _remove_asset(asset, db)

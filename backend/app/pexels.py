@@ -39,6 +39,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
             "media_type": "image",
             "title": item.get("alt") or f"Pexels 图片 {item['id']}",
             "preview_url": item.get("src", {}).get("medium", ""),
+            "preview_content_url": item.get("src", {}).get("original") or item.get("src", {}).get("large2x") or item.get("src", {}).get("large"),
             "author": item.get("photographer", ""),
             "source_page_url": item.get("url", ""),
             "width": item.get("width"),
@@ -52,6 +53,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
             "media_type": "video",
             "title": f"Pexels 视频 {item['id']}",
             "preview_url": (item.get("image") or ""),
+            "preview_content_url": _video_preview_url(item),
             "author": item.get("user", {}).get("name", ""),
             "source_page_url": item.get("url", ""),
             "width": item.get("width"),
@@ -64,6 +66,14 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
         "per_page": data.get("per_page", per_page),
         "total_results": data.get("total_results", len(items)),
     }
+
+
+def _video_preview_url(item: dict) -> str | None:
+    candidates = [file for file in item.get("video_files", []) if file.get("file_type") == "video/mp4" and file.get("link")]
+    if not candidates:
+        return None
+    selected = min(candidates, key=lambda file: (abs((file.get("width") or 0) - 1280), -(file.get("width") or 0)))
+    return selected["link"]
 
 
 def get_download(external_id: str, media_type: str) -> dict:

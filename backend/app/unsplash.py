@@ -46,6 +46,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
         "media_type": "image",
         "title": item.get("alt_description") or item.get("description") or f"Unsplash 图片 {item['id']}",
         "preview_url": item.get("urls", {}).get("small", ""),
+        "preview_content_url": item.get("urls", {}).get("full") or item.get("urls", {}).get("regular"),
         "author": item.get("user", {}).get("name", ""),
         "source_page_url": item.get("links", {}).get("html", ""),
         "width": item.get("width"),

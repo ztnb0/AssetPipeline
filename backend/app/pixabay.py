@@ -37,10 +37,12 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
     for item in data.get("hits", []):
         if media_type == "image":
             preview_url = item.get("webformatURL", "")
+            preview_content_url = item.get("largeImageURL") or preview_url
             width, height, duration = item.get("imageWidth"), item.get("imageHeight"), None
         else:
             rendition = item.get("videos", {}).get("medium") or item.get("videos", {}).get("small") or {}
             preview_url = rendition.get("thumbnail", "")
+            preview_content_url = rendition.get("url")
             width, height, duration = rendition.get("width"), rendition.get("height"), item.get("duration")
         items.append({
             "provider": "pixabay",
@@ -48,6 +50,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
             "media_type": media_type,
             "title": item.get("tags") or f"Pixabay 素材 {item['id']}",
             "preview_url": preview_url,
+            "preview_content_url": preview_content_url,
             "author": item.get("user", ""),
             "source_page_url": item.get("pageURL", ""),
             "width": width,

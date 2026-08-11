@@ -135,7 +135,7 @@ def search_assets(
     *,
     media_type: str | None = None,
     category: str | None = None,
-    limit: int = 100,
+    limit: int = 10,
 ) -> list[tuple[str, float]]:
     ensure_collection()
     vector = embed_texts([query], query=True)[0]
