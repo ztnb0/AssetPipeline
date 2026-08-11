@@ -183,27 +183,31 @@ export default function Home() {
   const [fredOpen, setFredOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const activeUploads = useRef(new Map<string, XMLHttpRequest | null>());
+  const searchRequestId = useRef(0);
 
-  const loadAssets = useCallback(async (q = "") => {
+  const loadAssets = useCallback(async (q = "", includeExternal = true) => {
+    const requestId = ++searchRequestId.current;
+    const mapSearchItems = (items: any[]): Asset[] => items.map((item: any) => {
+      const source = item.source === "local" ? "local" : "external";
+      const mediaType = item.source === "local" ? item.asset.media_type : item.media_type;
+      const searchGroup = `${mediaType}-${source}` as Asset["search_group"];
+      return item.source === "local" ? { ...item.asset, search_group: searchGroup } : ({
+        id: `external:${item.provider}:${item.external_id}`, original_name: item.title, media_type: item.media_type,
+        mime_type: item.media_type === "video" ? "video/mp4" : "image/jpeg", file_size: 0, width: item.width, height: item.height,
+        duration: item.duration ?? null, media_metadata: {}, status: "ready", description: `${providerText[item.provider as ExternalProvider]} 外部素材`,
+        scene: "External", tags: [item.provider], category: "External", categories: ["External"], error_message: null,
+        source_type: "external", source_id: item.external_id, source_page_url: item.source_page_url, source_author: item.author,
+        source_license: item.license, created_at: new Date().toISOString(), content_url: item.preview_url,
+        thumbnail_url: item.preview_url, preview_content_url: item.preview_content_url ?? null,
+        search_score: item.score, external_provider: item.provider, search_group: searchGroup,
+      });
+    });
     try {
-      const response = await fetch(q.trim() ? `${API}/search?q=${encodeURIComponent(q)}` : `${API}/assets`, { cache: "no-store" });
+      const response = await fetch(q.trim() ? `${API}/search?q=${encodeURIComponent(q)}&source=local` : `${API}/assets`, { cache: "no-store" });
       if (!response.ok) throw new Error("无法加载素材列表");
       const data = await response.json();
-      const nextAssets: Asset[] = q.trim() ? data.items.map((item: any) => {
-        const source = item.source === "local" ? "local" : "external";
-        const mediaType = item.source === "local" ? item.asset.media_type : item.media_type;
-        const searchGroup = `${mediaType}-${source}` as Asset["search_group"];
-        return item.source === "local" ? { ...item.asset, search_group: searchGroup } : ({
-          id: `external:${item.provider}:${item.external_id}`, original_name: item.title, media_type: item.media_type,
-          mime_type: item.media_type === "video" ? "video/mp4" : "image/jpeg", file_size: 0, width: item.width, height: item.height,
-          duration: item.duration ?? null, media_metadata: {}, status: "ready", description: `${providerText[item.provider as ExternalProvider]} 外部素材`,
-          scene: "External", tags: [item.provider], category: "External", categories: ["External"], error_message: null,
-          source_type: "external", source_id: item.external_id, source_page_url: item.source_page_url, source_author: item.author,
-          source_license: item.license, created_at: new Date().toISOString(), content_url: item.preview_url,
-          thumbnail_url: item.preview_url, preview_content_url: item.preview_content_url ?? null,
-          search_score: item.score, external_provider: item.provider, search_group: searchGroup,
-        });
-      }) : data.items;
+      if (requestId !== searchRequestId.current) return;
+      const nextAssets: Asset[] = q.trim() ? mapSearchItems(data.items) : data.items;
       setAssets(nextAssets);
       setQueryTerms(data.query_terms ?? []);
       setUploadItems((items) => items.map((item) => {
@@ -212,6 +216,15 @@ export default function Home() {
         if (!asset || asset.status === "processing") return item;
         return { ...item, status: asset.status, error: asset.error_message ?? undefined };
       }));
+      setLoading(false);
+
+      if (q.trim() && includeExternal) {
+        const externalResponse = await fetch(`${API}/search?q=${encodeURIComponent(q)}&source=external`, { cache: "no-store" });
+        if (!externalResponse.ok) throw new Error("外部素材加载失败");
+        const externalData = await externalResponse.json();
+        if (requestId !== searchRequestId.current) return;
+        setAssets((current) => [...current.filter((asset) => asset.source_type !== "external"), ...mapSearchItems(externalData.items)]);
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "请求失败");
     } finally {
@@ -240,7 +253,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!assets.some((asset) => asset.status === "processing")) return;
-    const timer = window.setInterval(() => loadAssets(query), 2000);
+    const timer = window.setInterval(() => loadAssets(query, false), 2000);
     return () => window.clearInterval(timer);
   }, [assets, loadAssets, query]);
 

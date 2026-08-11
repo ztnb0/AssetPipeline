@@ -208,9 +208,9 @@ POST /api/external-assets/import
 
 导入成功后，系统将原始素材保存到 MinIO，在 MySQL 中创建本地素材记录，并在后台自动生成描述、场景、题材分类和标签。分析成功后，素材状态变为 `ready`，同时写入 Qdrant 语义向量索引。
 
-首页输入语义搜索词时会同时展示本地素材和外部素材。外部素材卡片带有“导入素材库”按钮，点击后会直接调用 `POST /api/external-assets/import`；导入成功后，当前卡片会替换为本地素材并显示 AI 分析状态。同一 provider 和素材 ID 重复导入时，后端返回已有的本地素材，不会重复保存文件。
+首页输入语义搜索词时会同时展示本地素材和外部素材，但采用两阶段加载：先调用 `GET /api/search?source=local` 展示本地卡片，再调用 `GET /api/search?source=external` 异步追加外部卡片。外部平台或网络变慢不会阻塞本地结果。外部素材卡片带有“导入素材库”按钮，点击后会直接调用 `POST /api/external-assets/import`；导入成功后，当前卡片会替换为本地素材并显示 AI 分析状态。同一 provider 和素材 ID 重复导入时，后端返回已有的本地素材，不会重复保存文件。
 
-统一搜索结果按“图片/视频”以及“内部资源/外部资源”分组。内部图片和视频分别按内部综合得分返回前 20；外部图片从每个平台最多召回 20 条并跨平台重排后返回前 30；外部视频保留各平台原始顺序，每个平台返回前 10。
+统一搜索结果按“图片/视频”以及“内部资源/外部资源”分组。内部图片和视频分别按内部综合得分返回前 20；外部图片从每个平台最多召回 20 条，按平台原始排名合并后返回前 30；外部视频保留各平台原始顺序，每个平台返回前 10。交互式检索不会调用生成式模型扩词，也不会对外部结果再次执行 Embedding，查询向量会在后端进程内缓存，图片和视频检索可复用同一个向量。
 
 Mixkit 通过 Scrapling 读取公开的视频搜索页和详情页，当前仅支持英文关键词与视频素材。搜索阶段只展示远程缩略图；用户点击“导入素材库”后，后端才按 Mixkit Stock Video Free License 获取不超过 1080p 的视频文件。
 
@@ -230,6 +230,8 @@ Mixkit 通过 Scrapling 读取公开的视频搜索页和详情页，当前仅�
 GET /api/assets
 GET /api/search?q=对谈
 GET /api/search?q=人工智能&media_type=image
+GET /api/search?q=人工智能&source=local
+GET /api/search?q=人工智能&source=external
 ```
 
 参数说明：
@@ -239,8 +241,9 @@ GET /api/search?q=人工智能&media_type=image
 | `q` | 必填；对本地和外部素材执行统一检索 |
 | `media_type` | 可选；`image` 或 `video`，不传时同时检索两者 |
 | `category` | 本地素材检索可使用题材分类过滤，例如 `财经`、`科技` |
+| `source` | 可选；`all`（默认）、`local` 或 `external`。前端使用后两者分阶段加载 |
 
-响应中的 `query_terms` 表示从候选素材的文件名、描述、场景、分类和标签中提取出的真实相关短语。通用近义词仍用于内部召回，但不会作为素材相关扩展展示。
+响应中的 `query_terms` 当前包含原始搜索词；内置通用近义词只参与内部关键词召回，不会作为扩展词展示。交互式搜索不再同步调用生成式模型提取扩展短语。
 
 #### 向量生成与同步
 
@@ -290,7 +293,7 @@ MySQL 是素材元数据的事实源，Qdrant 是可以从 MySQL 重新生成的
 - 重新分析素材时先删除旧向量，分析成功后写入新向量
 - Qdrant 或 Embedding 服务暂时不可用时，素材处理和关键词检索仍可使用；下次后端启动会再次补建缺失向量
 
-用户查询会使用同一个 Embedding 模型生成查询向量。最终排序分数为 `75%` 向量相似度加 `25%` 关键词命中分，并支持 `media_type` 和 `category` 过滤。响应中的 `search_score` 表示该综合相关度；未提供 `q` 时该字段为 `null`。
+用户查询会使用同一个 Embedding 模型生成查询向量。查询向量使用进程内 LRU 缓存，因而同一查询的图片、视频检索以及短期重复检索不需要重复调用远程 Embedding 服务。最终排序分数为 `75%` 向量相似度加 `25%` 关键词命中分，并支持 `media_type` 和 `category` 过滤。响应中的 `search_score` 表示该综合相关度；未提供 `q` 时该字段为 `null`。后端为每次统一搜索记录 `local_ms`、`external_ms`、`total_ms` 和结果数，可通过 `docker compose logs backend` 定位耗时。
 
 Qdrant 管理界面位于 `http://localhost:6333/dashboard`。素材数量较少时，面板可能显示 `indexed_vectors_count = 0`，这是因为 Qdrant 直接遍历少量向量而未建立 HNSW 索引，不表示向量尚未写入；实际记录数应查看 `points_count`。
 

@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Iterable
+from functools import lru_cache
 
 import httpx
 from sqlalchemy import select
@@ -70,6 +71,12 @@ def embed_texts(texts: list[str], *, query: bool = False) -> list[list[float]]:
     return vectors
 
 
+@lru_cache(maxsize=512)
+def embed_query(query: str) -> tuple[float, ...]:
+    """Cache search embeddings so media-specific searches share one remote call."""
+    return tuple(embed_texts([query.strip()], query=True)[0])
+
+
 def ensure_collection() -> None:
     base_url = settings.qdrant_url.rstrip("/")
     with httpx.Client(timeout=20) as client:
@@ -138,7 +145,7 @@ def search_assets(
     limit: int = 10,
 ) -> list[tuple[str, float]]:
     ensure_collection()
-    vector = embed_texts([query], query=True)[0]
+    vector = embed_query(query)
     must = [{"key": "status", "match": {"value": AssetStatus.ready.value}}]
     if media_type:
         must.append({"key": "media_type", "match": {"value": media_type}})

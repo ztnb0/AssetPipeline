@@ -19,6 +19,14 @@ SYNONYMS = {
 }
 
 
+def expand_query_fast(query: str) -> list[str]:
+    """Expand a query without putting a generative-model call on the search path."""
+    query = query.strip()
+    if not query:
+        return []
+    return list(dict.fromkeys([query, *SYNONYMS.get(query, [])]))[:12]
+
+
 @lru_cache(maxsize=256)
 def expand_query(query: str) -> list[str]:
     query = query.strip()

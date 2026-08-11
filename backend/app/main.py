@@ -4,7 +4,6 @@ import threading
 import time
 import uuid
 import re
-import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,10 +41,10 @@ from .schemas import (
     ImportJobOut,
     FredChartCreate,
 )
-from .semantic import expand_from_assets, expand_query
+from .semantic import expand_query_fast
 from .storage import delete_object, delete_prefix, ensure_bucket, get_object, move_object, put_bytes
 from .unsplash import UnsplashError, download as download_unsplash, get_download as get_unsplash_download, search as search_unsplash
-from .vector_store import embed_texts, reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
+from .vector_store import reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
 
 
 ALLOWED_TYPES = {
@@ -376,23 +375,10 @@ def list_assets(
 
     if q.strip():
         source_query = q.strip()
-        generic_terms = expand_query(source_query)
-        candidate_matches = []
-        for candidate_term in generic_terms:
-            term = f"%{candidate_term}%"
-            candidate_matches.extend([
-                Asset.original_name.like(term), Asset.description.like(term), Asset.scene.like(term),
-                Asset.category.like(term), cast(Asset.categories, String).like(term), cast(Asset.tags, String).like(term),
-            ])
-        candidate_query = select(Asset).where(or_(*candidate_matches), *base_filters).limit(50)
-        candidates = db.scalars(candidate_query).all()
-        corpus = []
-        for asset in candidates:
-            corpus.extend([
-                asset.original_name, asset.description or "", asset.scene or "", asset.category or "",
-                *(asset.categories or []), *(asset.tags or []),
-            ])
-        asset_terms = expand_from_assets(source_query, corpus)
+        generic_terms = expand_query_fast(source_query)
+        # Vector search already supplies semantic recall, so no generative-model
+        # expansion or preliminary candidate query is needed here.
+        asset_terms: list[str] = []
         query_terms = [source_query, *asset_terms]
         search_terms = list(dict.fromkeys([*generic_terms, *asset_terms]))
         semantic_matches = []
@@ -445,18 +431,12 @@ def _normalized_page_url(url: str) -> str:
     return value.rstrip("/?")
 
 
-def _cosine(left: list[float], right: list[float]) -> float:
-    dot = sum(a * b for a, b in zip(left, right))
-    norm_left = math.sqrt(sum(value * value for value in left))
-    norm_right = math.sqrt(sum(value * value for value in right))
-    return dot / (norm_left * norm_right) if norm_left and norm_right else 0.0
-
-
 @app.get("/api/search")
 def unified_search(
     q: str = Query(min_length=1, max_length=100),
     media_type: str | None = Query(default=None, pattern="^(image|video)$"),
     category: str | None = Query(default=None, max_length=80),
+    source: str = Query(default="all", pattern="^(all|local|external)$"),
     db: Session = Depends(get_db),
 ):
     """Search local assets and external providers without importing external files."""
@@ -471,50 +451,44 @@ def unified_search(
     }
     provider_order = {provider: index for index, provider in enumerate(searchers)}
     requested_types = [media_type] if media_type else ["image", "video"]
+    started_at = time.perf_counter()
     local_groups = {"image": [], "video": []}
     query_terms = [q]
-    for requested_type in requested_types:
-        local = list_assets(q=q, media_type=requested_type, category=category, db=db)
-        local_groups[requested_type] = [
-            {"source": "local", "asset": item, "score": item.search_score or 0.0}
-            for item in local.items[:20]
-        ]
-        query_terms.extend(local.query_terms)
+    if source != "external":
+        for requested_type in requested_types:
+            local = list_assets(q=q, media_type=requested_type, category=category, db=db)
+            local_groups[requested_type] = [
+                {"source": "local", "asset": item, "score": item.search_score or 0.0}
+                for item in local.items[:20]
+            ]
+            query_terms.extend(local.query_terms)
+    local_elapsed = time.perf_counter() - started_at
 
     external: list[dict] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(searcher, q.strip(), requested_type, 1, 20): (provider, requested_type)
-            for provider, searcher in searchers.items()
-            for requested_type in requested_types
-            if requested_type in provider_media[provider]
-        }
-        for future in as_completed(futures):
-            provider, _requested_type = futures[future]
-            try:
-                result = future.result()
-            except Exception:
-                logger.warning("External search failed for %s", provider, exc_info=True)
-                continue
-            for rank, item in enumerate(result.get("items", []), start=1):
-                item = {**item, "provider_rank": rank}
-                item["source"] = "external"
-                external.append(item)
+    if source != "local":
+        with ThreadPoolExecutor(max_workers=len(searchers) * len(requested_types)) as pool:
+            futures = {
+                pool.submit(searcher, q.strip(), requested_type, 1, 20): (provider, requested_type)
+                for provider, searcher in searchers.items()
+                for requested_type in requested_types
+                if requested_type in provider_media[provider]
+            }
+            for future in as_completed(futures):
+                provider, _requested_type = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.warning("External search failed for %s", provider, exc_info=True)
+                    continue
+                for rank, item in enumerate(result.get("items", []), start=1):
+                    item = {**item, "provider_rank": rank}
+                    item["source"] = "external"
+                    external.append(item)
     external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
     external_images = [item for item in external if item.get("media_type") == "image"]
     if external_images:
-        try:
-            query_vector = embed_texts([q], query=True)[0]
-            texts = [" ".join(str(item.get(key) or "") for key in ("title", "author", "media_type")) for item in external_images]
-            vectors = embed_texts(texts)
-            for item, vector in zip(external_images, vectors, strict=True):
-                semantic_score = max(0.0, min(1.0, _cosine(query_vector, vector)))
-                rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19))
-                item["score"] = round(0.85 * semantic_score + 0.15 * rank_score, 6)
-        except Exception:
-            logger.warning("External image embedding unavailable; using provider rank", exc_info=True)
-            for item in external_images:
-                item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
+        for item in external_images:
+            item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
         external_images.sort(key=lambda item: (item["score"], -provider_order[item["provider"]]), reverse=True)
     external_image_items = [{"source": "external", **item} for item in external_images[:30]]
 
@@ -536,6 +510,12 @@ def unified_search(
         *groups["image"]["local"], *groups["image"]["external"],
         *groups["video"]["local"], *groups["video"]["external"],
     ]
+    logger.info(
+        "search timing query=%r source=%s local_ms=%d external_ms=%d total_ms=%d results=%d",
+        q, source, local_elapsed * 1000,
+        (time.perf_counter() - started_at - local_elapsed) * 1000,
+        (time.perf_counter() - started_at) * 1000, len(results),
+    )
     return {
         "items": results,
         "groups": groups,
