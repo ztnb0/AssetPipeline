@@ -10,22 +10,25 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from botocore.exceptions import ClientError
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .database import Base, engine, get_db, migrate_demo_schema
-from .models import Asset, AssetStatus
+from .database import Base, SessionLocal, engine, get_db, migrate_demo_schema
+from .models import Asset, AssetStatus, ImportJob, ImportJobStatus
 from .fred import FredError, generate_chart as generate_fred_chart, list_series as list_fred_series
+from .ibaotu import IbaotuError, search as search_ibaotu
+from .import_jobs import run_ibaotu_import
 from .openverse import OpenverseError, download as download_openverse, get_download as get_openverse_download, search as search_openverse
 from .pexels import PexelsError, download as download_pexels, get_download as get_pexels_download, search as search_pexels
 from .pixabay import PixabayError, download as download_pixabay, get_download as get_pixabay_download, search as search_pixabay
 from .processor import process_asset
 from .media_export import export_asset
-from .mixkit import MixkitError, download as download_mixkit, get_download as get_mixkit_download, search as search_mixkit
+from .mixkit import MixkitError, download as download_mixkit, get_download as get_mixkit_download, get_preview as get_mixkit_preview, search as search_mixkit
 from .schemas import (
     AssetBatchDelete,
     AssetBatchDeleteResult,
@@ -35,6 +38,8 @@ from .schemas import (
     AssetUpdate,
     ExternalAssetImport,
     ExternalAssetList,
+    ExternalAssetPreviewOut,
+    ImportJobOut,
     FredChartCreate,
 )
 from .semantic import expand_from_assets, expand_query
@@ -75,6 +80,20 @@ async def lifespan(_: FastAPI):
             time.sleep(2)
     if last_error:
         raise last_error
+    recovery_db = SessionLocal()
+    try:
+        pending_jobs = recovery_db.scalars(select(ImportJob).where(
+            ImportJob.status.in_((ImportJobStatus.queued, ImportJobStatus.running))
+        )).all()
+        for job in pending_jobs:
+            threading.Thread(
+                target=run_ibaotu_import,
+                args=(job.id,),
+                daemon=True,
+                name=f"import-recovery-{job.id[:8]}",
+            ).start()
+    finally:
+        recovery_db.close()
     threading.Thread(target=reindex_ready_assets, daemon=True, name="vector-index-sync").start()
     yield
 
@@ -199,19 +218,40 @@ async def upload_asset(
 @app.get("/api/external-assets/search", response_model=ExternalAssetList)
 def search_external_assets(
     q: str = Query(min_length=1, max_length=100),
-    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit)$"),
+    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit|ibaotu)$"),
     media_type: str = Query(default="image", pattern="^(image|video)$"),
     page: int = Query(default=1, ge=1, le=100),
     per_page: int = Query(default=12, ge=1, le=40),
 ):
     try:
-        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
+        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
         return searchers[provider](q.strip(), media_type, page, per_page)
-    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError) as exc:
+    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError, IbaotuError) as exc:
         raise HTTPException(503, str(exc)) from exc
 
 
-@app.post("/api/external-assets/import", response_model=AssetOut, status_code=202)
+@app.get("/api/external-assets/preview", response_model=ExternalAssetPreviewOut)
+def external_asset_preview(
+    provider: str = Query(pattern="^mixkit$"),
+    external_id: str = Query(min_length=1, max_length=100),
+    media_type: str = Query(pattern="^video$"),
+):
+    try:
+        preview = get_mixkit_preview(external_id, media_type)
+    except MixkitError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return ExternalAssetPreviewOut(
+        provider=provider,
+        external_id=external_id,
+        media_type=media_type,
+        preview_content_url=preview["url"],
+        mime_type="video/mp4",
+        width=preview.get("width"),
+        height=preview.get("height"),
+    )
+
+
+@app.post("/api/external-assets/import", response_model=AssetOut | ImportJobOut, status_code=202)
 def import_external_asset(
     payload: ExternalAssetImport,
     background_tasks: BackgroundTasks,
@@ -221,8 +261,30 @@ def import_external_asset(
         Asset.source_type == payload.provider,
         Asset.source_id == payload.external_id,
     ))
-    if existing:
+    if existing and payload.provider == "ibaotu" and (existing.source_metadata or {}).get("licensed_media_filename"):
+        if existing.media_type == "video" and not (existing.media_metadata or {}).get("preview_key"):
+            existing.status = AssetStatus.processing
+            db.commit()
+            background_tasks.add_task(process_asset, existing.id)
         return serialize(existing)
+    if existing and (
+        payload.provider != "ibaotu"
+    ):
+        return serialize(existing)
+    if payload.provider == "ibaotu":
+        active = db.scalar(select(ImportJob).where(
+            ImportJob.provider == "ibaotu",
+            ImportJob.external_id == payload.external_id,
+            ImportJob.status.in_((ImportJobStatus.queued, ImportJobStatus.running)),
+        ).order_by(ImportJob.created_at.desc()))
+        if active:
+            return active
+        job = ImportJob(provider="ibaotu", external_id=payload.external_id, media_type=payload.media_type)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        background_tasks.add_task(run_ibaotu_import, job.id)
+        return job
     try:
         providers = {
             "pexels": (get_pexels_download, download_pexels, PexelsError, "Pexels License"),
@@ -251,6 +313,14 @@ def import_external_asset(
     if asset.status == AssetStatus.processing:
         background_tasks.add_task(process_asset, asset.id)
     return serialize(asset)
+
+
+@app.get("/api/external-assets/import-jobs/{job_id}", response_model=ImportJobOut)
+def get_import_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(ImportJob, job_id)
+    if not job:
+        raise HTTPException(404, "导入任务不存在")
+    return job
 
 
 @app.get("/api/fred/series")
@@ -390,13 +460,14 @@ def unified_search(
     db: Session = Depends(get_db),
 ):
     """Search local assets and external providers without importing external files."""
-    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
+    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
     provider_media = {
         "pexels": {"image", "video"},
         "pixabay": {"image", "video"},
         "unsplash": {"image"},
         "openverse": {"image"},
         "mixkit": {"video"},
+        "ibaotu": {"image", "video"},
     }
     provider_order = {provider: index for index, provider in enumerate(searchers)}
     requested_types = [media_type] if media_type else ["image", "video"]
@@ -483,21 +554,36 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
     return serialize(asset)
 
 
-def stream_key(key: str, headers: dict[str, str] | None = None):
-    response = get_object(key)
+def stream_key(key: str, headers: dict[str, str] | None = None, range_header: str | None = None):
+    try:
+        response = get_object(key, range_header)
+    except ClientError as exc:
+        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 416:
+            raise HTTPException(416, "请求的视频范围无效") from exc
+        raise
+    response_headers = {
+        **(headers or {}),
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(response.get("ContentLength", 0)),
+    }
+    if response.get("ContentRange"):
+        response_headers["Content-Range"] = response["ContentRange"]
     return StreamingResponse(
         response["Body"].iter_chunks(),
         media_type=response.get("ContentType", "application/octet-stream"),
-        headers=headers,
+        headers=response_headers,
+        status_code=206 if response.get("ContentRange") else 200,
     )
 
 
 @app.get("/api/assets/{asset_id}/content")
-def asset_content(asset_id: str, db: Session = Depends(get_db)):
+def asset_content(asset_id: str, range_header: str | None = Header(default=None, alias="Range"), db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
     if not asset:
         raise HTTPException(404, "素材不存在")
-    return stream_key(asset.object_key)
+    metadata = asset.media_metadata or {}
+    preview_key = metadata.get("preview_key") if asset.media_type == "video" else None
+    return stream_key(preview_key or asset.object_key, range_header=range_header)
 
 
 @app.get("/api/assets/{asset_id}/thumbnail")
@@ -598,6 +684,12 @@ def _remove_asset(asset: Asset, db: Session) -> None:
     delete_object(asset.object_key)
     if asset.thumbnail_key:
         delete_object(asset.thumbnail_key)
+    preview_key = (asset.media_metadata or {}).get("preview_key")
+    if preview_key:
+        delete_object(preview_key)
+    source_metadata = asset.source_metadata or {}
+    if source_metadata.get("source_file_key"):
+        delete_object(source_metadata["source_file_key"])
     delete_prefix(f"exports/{asset.id}/")
     db.delete(asset)
     db.commit()

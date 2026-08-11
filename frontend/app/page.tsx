@@ -49,16 +49,18 @@ type Asset = {
   thumbnail_url: string | null;
   search_score?: number | null;
   external_provider?: ExternalProvider;
+  preview_content_url?: string | null;
   search_group?: "image-local" | "image-external" | "video-local" | "video-external";
 };
 
-type ExternalProvider = "pexels" | "pixabay" | "unsplash" | "openverse" | "mixkit";
+type ExternalProvider = "pexels" | "pixabay" | "unsplash" | "openverse" | "mixkit" | "ibaotu";
 type ExternalAsset = {
   provider: ExternalProvider;
   external_id: string;
   media_type: "image" | "video";
   title: string;
   preview_url: string;
+  preview_content_url: string | null;
   author: string;
   source_page_url: string;
   width: number | null;
@@ -66,6 +68,30 @@ type ExternalAsset = {
   duration: number | null;
   license: string | null;
   license_url: string | null;
+};
+
+type ExternalPreviewItem = {
+  provider: ExternalProvider;
+  external_id: string;
+  media_type: "image" | "video";
+  title: string;
+  preview_url: string;
+  preview_content_url: string | null;
+  author: string;
+  source_page_url: string;
+  width: number | null;
+  height: number | null;
+  duration: number | null;
+  license: string | null;
+};
+
+type ImportJob = {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  stage: "queued" | "authorizing" | "downloading" | "extracting" | "storing" | "completed" | "failed";
+  progress: number;
+  asset_id: string | null;
+  error_message: string | null;
 };
 
 type FredSeries = { id: string; label: string; short: string; category: string };
@@ -105,8 +131,35 @@ function durationText(seconds: number | null) {
   return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
+function importProgressText(job: ImportJob) {
+  if (job.stage === "authorizing") return "正在校验 VIP 权益…";
+  if (job.stage === "downloading") return `下载 ${job.progress}%`;
+  if (job.stage === "extracting") return "正在解压…";
+  if (job.stage === "storing") return `正在入库 ${job.progress}%`;
+  return "正在准备导入…";
+}
+
+async function resolveImport(result: Asset | ImportJob, onProgress: (label: string) => void): Promise<Asset> {
+  if (!("stage" in result)) return result;
+  let job = result;
+  while (job.status === "queued" || job.status === "running") {
+    onProgress(importProgressText(job));
+    await new Promise((resolve) => window.setTimeout(resolve, 750));
+    const response = await fetch(`${API}/external-assets/import-jobs/${job.id}`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "无法读取导入进度");
+    job = data;
+  }
+  if (job.status === "failed") throw new Error(job.error_message || "素材导入失败");
+  if (!job.asset_id) throw new Error("导入完成但没有返回素材 ID");
+  const response = await fetch(`${API}/assets/${job.asset_id}`, { cache: "no-store" });
+  const asset = await response.json();
+  if (!response.ok) throw new Error(asset.detail || "无法读取已导入素材");
+  return asset;
+}
+
 const mediaText: Record<string, string> = { image: "图片", video: "视频", audio: "音频" };
-const providerText: Record<ExternalProvider, string> = { pexels: "Pexels", pixabay: "Pixabay", unsplash: "Unsplash", openverse: "Openverse", mixkit: "Mixkit" };
+const providerText: Record<ExternalProvider, string> = { pexels: "Pexels", pixabay: "Pixabay", unsplash: "Unsplash", openverse: "Openverse", mixkit: "Mixkit", ibaotu: "包图网" };
 const categoryOptions = ["科技", "财经", "金融市场", "宏观经济", "金融理财", "投资管理", "保险规划", "养老规划", "税务规划", "财富传承", "私人银行", "金融教育", "财经新闻", "民生", "教育", "商业", "文化", "娱乐", "体育", "医疗", "自然", "交通", "工业", "政务", "音频制作", "待内容识别", "其他"];
 
 export default function Home() {
@@ -118,11 +171,12 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [queryTerms, setQueryTerms] = useState<string[]>([]);
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
+  const [externalPreview, setExternalPreview] = useState<ExternalPreviewItem | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Asset | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
-  const [importingExternalId, setImportingExternalId] = useState<string | null>(null);
+  const [externalImportTasks, setExternalImportTasks] = useState<Record<string, string>>({});
   const [typeFilter, setTypeFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [externalOpen, setExternalOpen] = useState(false);
@@ -146,7 +200,8 @@ export default function Home() {
           scene: "External", tags: [item.provider], category: "External", categories: ["External"], error_message: null,
           source_type: "external", source_id: item.external_id, source_page_url: item.source_page_url, source_author: item.author,
           source_license: item.license, created_at: new Date().toISOString(), content_url: item.preview_url,
-          thumbnail_url: item.preview_url, search_score: item.score, external_provider: item.provider, search_group: searchGroup,
+          thumbnail_url: item.preview_url, preview_content_url: item.preview_content_url ?? null,
+          search_score: item.score, external_provider: item.provider, search_group: searchGroup,
         });
       }) : data.items;
       setAssets(nextAssets);
@@ -397,28 +452,36 @@ export default function Home() {
     }
   }
 
-  async function importExternalAsset(asset: Asset) {
-    if (!asset.external_provider || !asset.source_id) return;
-    setImportingExternalId(asset.id);
+  async function importExternalAsset(item: ExternalPreviewItem) {
+    const cardId = `external:${item.provider}:${item.external_id}`;
+    if (externalImportTasks[cardId]) return;
+    const setTaskProgress = (label: string) => setExternalImportTasks((tasks) => ({ ...tasks, [cardId]: label }));
+    setTaskProgress("正在准备导入…");
     setMessage("");
     try {
       const response = await fetch(`${API}/external-assets/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          provider: asset.external_provider,
-          external_id: asset.source_id,
-          media_type: asset.media_type,
+          provider: item.provider,
+          external_id: item.external_id,
+          media_type: item.media_type,
         }),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || `${providerText[asset.external_provider]} 素材导入失败`);
-      setAssets((items) => items.map((item) => item.id === asset.id ? data : item));
-      setMessage(`${providerText[asset.external_provider]} 素材已导入，正在进行 AI 分析`);
+      if (!response.ok) throw new Error(data.detail || `${providerText[item.provider]} 素材导入失败`);
+      const asset = await resolveImport(data, setTaskProgress);
+      setAssets((items) => items.map((candidate) => candidate.id === cardId ? asset : candidate));
+      setMessage(`${providerText[item.provider]} 素材已导入，正在进行 AI 分析`);
+      setExternalPreview(null);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "素材导入失败");
     } finally {
-      setImportingExternalId(null);
+      setExternalImportTasks((tasks) => {
+        const next = { ...tasks };
+        delete next[cardId];
+        return next;
+      });
     }
   }
 
@@ -447,6 +510,24 @@ export default function Home() {
     return sections;
   });
   const displaySections = isSearchResults ? searchSections : browseSections;
+
+  function toExternalPreview(asset: Asset): ExternalPreviewItem | null {
+    if (!asset.external_provider || !asset.source_id || (asset.media_type !== "image" && asset.media_type !== "video")) return null;
+    return {
+      provider: asset.external_provider,
+      external_id: asset.source_id,
+      media_type: asset.media_type,
+      title: asset.original_name,
+      preview_url: asset.thumbnail_url || asset.content_url,
+      preview_content_url: asset.preview_content_url || null,
+      author: asset.source_author || "",
+      source_page_url: asset.source_page_url || "",
+      width: asset.width,
+      height: asset.height,
+      duration: asset.duration,
+      license: asset.source_license,
+    };
+  }
 
   function toggleAllVisible() {
     setSelectedIds((current) => {
@@ -561,7 +642,7 @@ export default function Home() {
             <header className="mb-4 flex items-center justify-between border-b border-white/10 pb-3"><div><span className="text-[10px] font-semibold uppercase tracking-[.2em] text-teal-400">{section.eyebrow}</span><h3 className="mt-1 text-lg font-semibold text-white">{section.title}</h3></div><span className="text-xs text-slate-500">{section.assets.length} 项素材</span></header>
             <div className="grid items-start gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {section.assets.map((asset) => (
-            <article key={asset.id} role="button" tabIndex={0} aria-label={`查看 ${asset.original_name} 详情`} onClick={() => setSelectedAsset(asset)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedAsset(asset); }} className="cursor-pointer overflow-hidden rounded-2xl border border-white/10 bg-[#11161e]/90 shadow-2xl shadow-black/20 transition hover:-translate-y-0.5 hover:border-teal-400/30 focus:outline-none focus:ring-2 focus:ring-teal-400/60">
+            <article key={asset.id} role="button" tabIndex={0} aria-label={asset.source_type === "external" ? `在线预览 ${asset.original_name}` : `查看 ${asset.original_name} 详情`} onClick={() => { const preview = toExternalPreview(asset); if (preview) setExternalPreview(preview); else setSelectedAsset(asset); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { const preview = toExternalPreview(asset); if (preview) setExternalPreview(preview); else setSelectedAsset(asset); } }} className="cursor-pointer overflow-hidden rounded-2xl border border-white/10 bg-[#11161e]/90 shadow-2xl shadow-black/20 transition hover:-translate-y-0.5 hover:border-teal-400/30 focus:outline-none focus:ring-2 focus:ring-teal-400/60">
               <div className="relative overflow-hidden bg-slate-900" style={{ aspectRatio: asset.width && asset.height ? `${asset.width} / ${asset.height}` : "16 / 9" }}>
                 {asset.source_type !== "external" && <label className="absolute bottom-2.5 left-2.5 z-10 flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-white/20 bg-black/70 backdrop-blur" onClick={(event) => event.stopPropagation()}>
                   <input type="checkbox" aria-label={`选择 ${asset.original_name}`} checked={selectedIds.has(asset.id)} onChange={() => toggleSelected(asset.id)} className="h-4 w-4 accent-teal-400" />
@@ -586,7 +667,7 @@ export default function Home() {
                   {asset.tags.slice(0, 6).map((tag) => <span key={tag} className="rounded-md border border-white/10 bg-white/[.055] px-2 py-1 text-[10px] text-slate-300">{tag}</span>)}
                   {asset.tags.length > 6 && <span className="px-1 py-1 text-[10px] text-slate-600">+{asset.tags.length - 6}</span>}
                 </div>
-                {asset.source_type === "external" && <button type="button" disabled={importingExternalId !== null} onClick={(event) => { event.stopPropagation(); void importExternalAsset(asset); }} className="mt-3 h-10 w-full rounded-md bg-teal-400 text-xs font-semibold text-slate-950 transition hover:bg-teal-300 disabled:cursor-wait disabled:opacity-50">{importingExternalId === asset.id ? "正在下载并导入…" : "导入素材库"}</button>}
+                {asset.source_type === "external" && <button type="button" disabled={Boolean(externalImportTasks[asset.id])} onClick={(event) => { event.stopPropagation(); const preview = toExternalPreview(asset); if (preview) void importExternalAsset(preview); }} className="mt-3 h-10 w-full rounded-md bg-teal-400 text-xs font-semibold text-slate-950 transition hover:bg-teal-300 disabled:cursor-wait disabled:opacity-50">{externalImportTasks[asset.id] || (asset.external_provider === "ibaotu" ? "VIP 下载并导入" : "导入素材库")}</button>}
               </div>
             </article>
           ))}
@@ -596,6 +677,7 @@ export default function Home() {
       )}
 
       {selectedAsset && <AssetDetail asset={selectedAsset} onClose={() => setSelectedAsset(null)} onSaved={(next) => { setSelectedAsset(next); setAssets((items) => items.map((item) => item.id === next.id ? next : item)); }} onDeleted={(id) => { setSelectedAsset(null); setAssets((items) => items.filter((item) => item.id !== id)); }} />}
+      {externalPreview && <ExternalAssetPreview item={externalPreview} importing={Boolean(externalImportTasks[`external:${externalPreview.provider}:${externalPreview.external_id}`])} importingLabel={externalImportTasks[`external:${externalPreview.provider}:${externalPreview.external_id}`]} onClose={() => setExternalPreview(null)} onImport={() => importExternalAsset(externalPreview)} />}
       {deleteTarget && <DeleteConfirm asset={deleteTarget} deleting={deleting} onCancel={() => setDeleteTarget(null)} onConfirm={confirmDelete} />}
       {externalOpen && <ExternalAssetBrowser onClose={() => setExternalOpen(false)} onImported={async (provider) => { setMessage(`${providerText[provider]} 素材已导入，正在进行 AI 分析`); await loadAssets(query); }} />}
       {fredOpen && <FredChartBuilder onClose={() => setFredOpen(false)} onCreated={async () => { setMessage("FRED 财经图表已生成，正在进行 AI 分析"); await loadAssets(query); }} />}
@@ -712,6 +794,78 @@ function AssetDetail({ asset, onClose, onSaved, onDeleted }: { asset: Asset; onC
         </div>
       </section>
       {exportOpen && <ExportEditor asset={asset} onClose={() => setExportOpen(false)} />}
+    </div>
+  );
+}
+
+function ExternalAssetPreview({ item, importing, importingLabel, onClose, onImport }: { item: ExternalPreviewItem; importing: boolean; importingLabel?: string; onClose: () => void; onImport: () => Promise<void> }) {
+  const [contentUrl, setContentUrl] = useState(item.preview_content_url);
+  const [loading, setLoading] = useState(!item.preview_content_url);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  useEffect(() => {
+    if (item.preview_content_url) {
+      setContentUrl(item.preview_content_url);
+      setLoading(false);
+      return;
+    }
+    if (item.media_type === "image") {
+      setContentUrl(item.preview_url);
+      setLoading(false);
+      return;
+    }
+    if (item.provider !== "mixkit") {
+      setLoading(false);
+      setError("该素材平台没有返回可播放的预览地址");
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    const params = new URLSearchParams({ provider: item.provider, external_id: item.external_id, media_type: item.media_type });
+    fetch(`${API}/external-assets/preview?${params}`, { cache: "no-store" })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "无法加载在线预览");
+        return data.preview_content_url as string;
+      })
+      .then((url) => { if (!cancelled) setContentUrl(url); })
+      .catch((previewError) => { if (!cancelled) setError(previewError instanceof Error ? previewError.message : "无法加载在线预览"); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [item]);
+
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/85 p-3 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="external-preview-title" className="flex max-h-[94vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-white/15 bg-[#0f141b] shadow-2xl">
+        <header className="flex items-center justify-between border-b border-white/10 px-5 py-4 sm:px-6">
+          <div className="min-w-0"><div className="text-[10px] font-semibold uppercase text-teal-400">{providerText[item.provider]} 在线预览</div><h2 id="external-preview-title" className="mt-1 truncate text-lg font-semibold text-white">{item.title}</h2></div>
+          <button type="button" onClick={onClose} aria-label="关闭在线预览" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-xl text-slate-300 hover:bg-white/10">×</button>
+        </header>
+        <div className="grid min-h-0 flex-1 overflow-y-auto lg:grid-cols-[minmax(0,1fr)_320px]">
+          <div className="flex min-h-[360px] items-center justify-center bg-black/45 p-4 sm:p-6">
+            {loading ? <p className="text-sm text-slate-500">正在加载在线预览…</p> : error ? <div className="max-w-md text-center"><p className="text-sm text-red-300">{error}</p><img src={absoluteUrl(item.preview_url)} alt={item.title} className="mt-5 max-h-[55vh] max-w-full object-contain opacity-70" /></div> : item.media_type === "image" ? <img src={absoluteUrl(contentUrl || item.preview_url)} alt={item.title} onError={() => { if (contentUrl !== item.preview_url) setContentUrl(item.preview_url); else setError("外部图片暂时无法加载"); }} className="max-h-[75vh] max-w-full object-contain" /> : <video key={contentUrl} src={absoluteUrl(contentUrl)} poster={absoluteUrl(item.preview_url)} controls preload="metadata" onError={() => setError("外部视频暂时无法播放，可前往原始页面查看")} className="max-h-[75vh] w-full bg-black" />}
+          </div>
+          <aside className="border-t border-white/10 p-5 lg:border-l lg:border-t-0 lg:p-6">
+            <dl className="divide-y divide-white/[.07] border-y border-white/[.07] text-xs">
+              <div className="flex justify-between gap-4 py-3"><dt className="text-slate-500">素材类型</dt><dd className="text-slate-300">{mediaText[item.media_type]}</dd></div>
+              <div className="flex justify-between gap-4 py-3"><dt className="text-slate-500">来源平台</dt><dd className="text-slate-300">{providerText[item.provider]}</dd></div>
+              {item.author && <div className="flex justify-between gap-4 py-3"><dt className="text-slate-500">作者</dt><dd className="text-right text-slate-300">{item.author}</dd></div>}
+              {item.width && item.height && <div className="flex justify-between gap-4 py-3"><dt className="text-slate-500">原始尺寸</dt><dd className="text-slate-300">{item.width} × {item.height}</dd></div>}
+              {item.duration !== null && <div className="flex justify-between gap-4 py-3"><dt className="text-slate-500">时长</dt><dd className="text-slate-300">{durationText(item.duration)}</dd></div>}
+              {item.license && <div className="flex justify-between gap-4 py-3"><dt className="text-slate-500">使用许可</dt><dd className="text-right text-slate-300">{item.license}</dd></div>}
+            </dl>
+            {item.source_page_url && <a href={item.source_page_url} target="_blank" rel="noreferrer" className="mt-5 flex h-11 items-center justify-center rounded-md border border-white/15 text-sm font-medium text-slate-300 transition hover:bg-white/5 hover:text-white">查看原始页面 ↗</a>}
+            <button type="button" disabled={importing} onClick={() => void onImport()} className="mt-3 flex h-12 w-full items-center justify-center rounded-md bg-teal-400 text-sm font-semibold text-slate-950 transition hover:bg-teal-300 disabled:cursor-wait disabled:opacity-60">{importing ? (importingLabel || "正在准备导入…") : item.provider === "ibaotu" ? "VIP 下载并导入素材库" : "导入素材库"}</button>
+          </aside>
+        </div>
+      </section>
     </div>
   );
 }
@@ -833,8 +987,9 @@ function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; on
   const [items, setItems] = useState<ExternalAsset[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [importingId, setImportingId] = useState<string | null>(null);
+  const [importTasks, setImportTasks] = useState<Record<string, string>>({});
   const [importedIds, setImportedIds] = useState<string[]>([]);
+  const [previewItem, setPreviewItem] = useState<ExternalAsset | null>(null);
 
   async function searchExternal(event: FormEvent) {
     event.preventDefault();
@@ -855,7 +1010,9 @@ function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; on
   }
 
   async function importAsset(item: ExternalAsset) {
-    setImportingId(item.external_id);
+    if (importTasks[item.external_id]) return;
+    const setTaskProgress = (label: string) => setImportTasks((tasks) => ({ ...tasks, [item.external_id]: label }));
+    setTaskProgress("正在准备导入…");
     setError("");
     try {
       const response = await fetch(`${API}/external-assets/import`, {
@@ -865,12 +1022,18 @@ function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; on
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || `${providerText[item.provider]} 素材导入失败`);
+      await resolveImport(data, setTaskProgress);
       setImportedIds((ids) => ids.includes(item.external_id) ? ids : [...ids, item.external_id]);
       await onImported(item.provider);
+      setPreviewItem(null);
     } catch (importError) {
       setError(importError instanceof Error ? importError.message : `${providerText[item.provider]} 素材导入失败`);
     } finally {
-      setImportingId(null);
+      setImportTasks((tasks) => {
+        const next = { ...tasks };
+        delete next[item.external_id];
+        return next;
+      });
     }
   }
 
@@ -894,17 +1057,18 @@ function ExternalAssetBrowser({ onClose, onImported }: { onClose: () => void; on
           {!loading && !items.length && <div className="flex min-h-56 items-center justify-center text-sm text-slate-500">输入关键词搜索 {providerText[provider]} {provider === "unsplash" || provider === "openverse" ? "图片" : "图片或视频"}</div>}
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">{items.map((item) => {
             const imported = importedIds.includes(item.external_id);
-            const importing = importingId === item.external_id;
-            return <article key={`${item.media_type}-${item.external_id}`} className="overflow-hidden rounded-lg border border-white/10 bg-white/[.035]">
-              <a href={item.source_page_url} target="_blank" rel="noreferrer" className="block overflow-hidden bg-black/30" style={{ aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : "16 / 9" }}><img src={item.preview_url} alt={item.title} className="h-full w-full object-contain transition hover:scale-[1.02]" /></a>
+            const importing = Boolean(importTasks[item.external_id]);
+            return <article key={`${item.media_type}-${item.external_id}`} role="button" tabIndex={0} aria-label={`在线预览 ${item.title}`} onClick={() => setPreviewItem(item)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setPreviewItem(item); }} className="cursor-pointer overflow-hidden rounded-lg border border-white/10 bg-white/[.035] transition hover:border-teal-400/30 focus:outline-none focus:ring-2 focus:ring-teal-400/60">
+              <div className="block overflow-hidden bg-black/30" style={{ aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : "16 / 9" }}><img src={item.preview_url} alt={item.title} className="h-full w-full object-contain transition hover:scale-[1.02]" /></div>
               <div className="p-3"><h3 title={item.title} className="truncate text-sm font-medium text-white">{item.title}</h3><p className="mt-1 truncate text-xs text-slate-500">作者：{item.author || `${providerText[item.provider]} 创作者`}</p>{item.license && <p className="mt-1 truncate text-[11px] text-emerald-400">许可：{item.license}</p>}
-                <button type="button" disabled={importing || imported || importingId !== null} onClick={() => importAsset(item)} className="mt-3 h-9 w-full rounded-md bg-teal-400/15 text-xs font-semibold text-teal-300 transition hover:bg-teal-400/25 disabled:opacity-50">{importing ? "正在下载…" : imported ? "已导入" : "导入素材库"}</button>
+                <button type="button" disabled={importing || imported} onClick={(event) => { event.stopPropagation(); void importAsset(item); }} className="mt-3 h-9 w-full rounded-md bg-teal-400/15 text-xs font-semibold text-teal-300 transition hover:bg-teal-400/25 disabled:opacity-50">{importing ? importTasks[item.external_id] : imported ? "已导入" : item.provider === "ibaotu" ? "VIP 下载并导入" : "导入素材库"}</button>
               </div>
             </article>;
           })}</div>
         </div>
-        <footer className="border-t border-white/10 px-5 py-3 text-[11px] text-slate-500 sm:px-6">素材由 {providerText[provider]} 提供。导入前请确认其许可证适用于你的使用场景。</footer>
+        <footer className="border-t border-white/10 px-5 py-3 text-[11px] text-slate-500 sm:px-6">素材由 {providerText[provider]} 提供。{provider === "ibaotu" ? "下载时会由包图网校验当前 VIP 权益；并非搜索结果中的所有素材都包含在你的套餐内。" : "导入前请确认其许可证适用于你的使用场景。"}</footer>
       </section>
+      {previewItem && <ExternalAssetPreview item={previewItem} importing={Boolean(importTasks[previewItem.external_id])} importingLabel={importTasks[previewItem.external_id]} onClose={() => setPreviewItem(null)} onImport={() => importAsset(previewItem)} />}
     </div>
   );
 }
