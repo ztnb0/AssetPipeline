@@ -44,7 +44,7 @@ from .schemas import (
 from .semantic import expand_query_fast
 from .storage import delete_object, delete_prefix, ensure_bucket, get_object, move_object, put_bytes
 from .unsplash import UnsplashError, download as download_unsplash, get_download as get_unsplash_download, search as search_unsplash
-from .vector_store import reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
+from .vector_store import embed_query, embed_texts, reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
 
 
 ALLOWED_TYPES = {
@@ -431,6 +431,38 @@ def _normalized_page_url(url: str) -> str:
     return value.rstrip("/?")
 
 
+def _cosine_similarity(left: tuple[float, ...] | list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = sum(value * value for value in left) ** 0.5
+    right_norm = sum(value * value for value in right) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    # Convert cosine similarity from [-1, 1] to a UI-friendly [0, 1] score.
+    return max(0.0, min(1.0, (dot / (left_norm * right_norm) + 1.0) / 2.0))
+
+
+def _rank_external_images(query: str, images: list[dict]) -> list[dict]:
+    if not images:
+        return []
+    documents = [
+        "\n".join((
+            f"素材类型：图片",
+            f"标题：{item.get('title', '')}",
+            f"作者：{item.get('author', '')}",
+            f"来源：{item.get('provider', '')}",
+        ))
+        for item in images
+    ]
+    query_vector = embed_query(query)
+    image_vectors = embed_texts(documents)
+    ranked = [
+        {"source": "external", **item, "score": round(_cosine_similarity(query_vector, vector), 6)}
+        for item, vector in zip(images, image_vectors, strict=True)
+    ]
+    ranked.sort(key=lambda item: (item["score"], -item["provider_rank"]), reverse=True)
+    return ranked
+
+
 @app.get("/api/search")
 def unified_search(
     q: str = Query(min_length=1, max_length=100),
@@ -449,8 +481,8 @@ def unified_search(
         "mixkit": {"video"},
         "ibaotu": {"image", "video"},
     }
-    # External image priority is provider-first. Keep each provider's native
-    # ranking, with licensed Baotu results shown before the other platforms.
+    # Provider order is retained only as the fallback when embedding-based
+    # semantic ranking is unavailable.
     provider_order = {
         "ibaotu": 0,
         "pexels": 1,
@@ -495,20 +527,22 @@ def unified_search(
                     external.append(item)
     external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
     external_images = [item for item in external if item.get("media_type") == "image"]
-    external_image_items = []
-    for provider in provider_order:
-        provider_images = [
-            item for item in external_images
-            if item.get("provider") == provider
-        ]
-        # The score is only the provider's original rank; no cross-provider
-        # semantic/vector re-ranking is performed for external results.
-        for item in provider_images[:20]:
-            item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
-            external_image_items.append({"source": "external", **item})
+    try:
+        external_image_items = _rank_external_images(q.strip(), external_images)
+    except Exception:
+        logger.exception("External image semantic ranking unavailable; falling back to provider ranking")
+        external_image_items = []
+        for provider in provider_order:
+            provider_images = [item for item in external_images if item.get("provider") == provider]
+            for item in provider_images:
+                rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19))
+                external_image_items.append({"source": "external", **item, "score": round(rank_score, 6)})
 
     external_video_items = []
-    for provider in searchers:
+    # Keep Baotu first for video assets; preserve the existing order for the
+    # remaining providers.
+    video_provider_order = ["ibaotu", "pexels", "pixabay", "unsplash", "openverse", "mixkit"]
+    for provider in video_provider_order:
         provider_videos = [
             item for item in external
             if item.get("media_type") == "video" and item.get("provider") == provider

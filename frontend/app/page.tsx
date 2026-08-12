@@ -214,9 +214,18 @@ export default function Home() {
       });
     });
     try {
-      const response = await fetch(q.trim() ? `${API}/search?q=${encodeURIComponent(q)}&source=local` : `${API}/assets`, { cache: "no-store" });
-      if (!response.ok) throw new Error("无法加载素材列表");
-      const data = await response.json();
+      const localUrl = q.trim() ? `${API}/search?q=${encodeURIComponent(q)}&source=local` : `${API}/assets`;
+      const externalUrl = q.trim() && includeExternal ? `${API}/search?q=${encodeURIComponent(q)}&source=external` : null;
+      const localRequest = fetch(localUrl, { cache: "no-store" }).then(async (response) => {
+        if (!response.ok) throw new Error("无法加载素材列表");
+        return response.json();
+      });
+      const externalRequest = externalUrl ? fetch(externalUrl, { cache: "no-store" }).then(async (response) => {
+        if (!response.ok) throw new Error("外部素材加载失败");
+        return response.json();
+      }) : null;
+
+      const data = await localRequest;
       if (requestId !== searchRequestId.current) return;
       const nextAssets: Asset[] = q.trim() ? mapSearchItems(data.items) : data.items;
       setAssets(nextAssets);
@@ -229,12 +238,11 @@ export default function Home() {
       }));
       setLoading(false);
 
-      if (q.trim() && includeExternal) {
-        const externalResponse = await fetch(`${API}/search?q=${encodeURIComponent(q)}&source=external`, { cache: "no-store" });
-        if (!externalResponse.ok) throw new Error("外部素材加载失败");
-        const externalData = await externalResponse.json();
-        if (requestId !== searchRequestId.current) return;
-        setAssets((current) => [...current.filter((asset) => asset.source_type !== "external"), ...mapSearchItems(externalData.items)]);
+      if (externalRequest) {
+        externalRequest.then((externalData) => {
+          if (requestId !== searchRequestId.current) return;
+          setAssets((current) => [...current.filter((asset) => asset.source_type !== "external"), ...mapSearchItems(externalData.items)]);
+        }).catch((error) => setMessage(error instanceof Error ? error.message : "外部素材加载失败"));
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "请求失败");
@@ -707,7 +715,7 @@ export default function Home() {
                 {asset.media_type !== "audio" && (asset.thumbnail_url || asset.content_url) && <img loading="lazy" decoding="async" src={absoluteUrl(asset.thumbnail_url || asset.content_url)} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }} className="h-full w-full object-cover" />}
                 {asset.media_type === "audio" && <div className="flex h-full items-center justify-center bg-gradient-to-br from-violet-950 to-slate-950"><div className="flex h-20 w-20 items-center justify-center rounded-full border border-violet-300/20 bg-violet-400/10 text-4xl text-violet-300">♫</div></div>}
                 <div className="absolute left-3 top-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-white/80 backdrop-blur">{mediaText[asset.media_type] ?? asset.media_type}</div>
-                {asset.search_score !== null && asset.search_score !== undefined && <div className="absolute left-3 top-11 rounded-md border border-teal-300/25 bg-teal-950/80 px-2 py-1 text-[10px] font-semibold text-teal-200 backdrop-blur">{asset.source_type === "external" ? "平台排名" : "相关度"} {(asset.search_score * 100).toFixed(0)}%</div>}
+                {asset.search_score !== null && asset.search_score !== undefined && <div className="absolute left-3 top-11 rounded-md border border-teal-300/25 bg-teal-950/80 px-2 py-1 text-[10px] font-semibold text-teal-200 backdrop-blur">相关度 {(asset.search_score * 100).toFixed(0)}%</div>}
                 <div className={`absolute right-3 top-3 rounded-full border px-2.5 py-1 text-[11px] font-medium backdrop-blur ${asset.status === "ready" ? "border-emerald-300/30 bg-emerald-950/70 text-emerald-300" : asset.status === "failed" ? "border-red-300/30 bg-red-950/70 text-red-300" : "border-amber-300/30 bg-amber-950/70 text-amber-200"}`}>{statusText[asset.status]}</div>
                 {asset.source_type !== "external" && <button type="button" aria-label={`删除 ${asset.original_name}`} onClick={(event) => { event.stopPropagation(); setDeleteTarget(asset); }} className="absolute bottom-2.5 right-2.5 flex h-8 w-8 items-center justify-center rounded-lg border border-red-300/20 bg-black/65 text-sm text-red-300 opacity-80 backdrop-blur transition hover:bg-red-500/25 hover:opacity-100">⌫</button>}
               </div>
