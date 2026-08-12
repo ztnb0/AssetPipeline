@@ -45,9 +45,24 @@ curl -X POST http://localhost:8000/api/assets/upload -F "file=@./sample.jpg"
 
 ### `GET /api/search`
 
-前端有搜索词时使用。结果按图片/视频、内部/外部分成四组，内部图片和内部视频分别按本地综合得分返回前 20 条。外部图片从每个平台最多召回 20 条，跨平台评分后返回前 30 条；外部视频不做项目侧语义重排，每个支持视频的平台保留其站内顺序并返回前 10 条。Pexels、Pixabay、包图网支持图片和视频，Unsplash、Openverse 仅支持图片，Mixkit 仅支持视频。
+前端有搜索词时使用。结果按图片/视频、内部/外部分成四组，内部图片和内部视频分别按本地综合得分返回前 20 条。外部图片不做项目侧 Embedding 或语义重排，按包图网、Pexels、Pixabay、Unsplash、Openverse、Mixkit 的固定平台优先级依次拼接，每个平台保留站内原始顺序并最多返回 20 条；外部视频同样不做项目侧语义重排，每个支持视频的平台保留其站内顺序并返回前 10 条。Pexels、Pixabay、包图网支持图片和视频，Unsplash、Openverse 仅支持图片，Mixkit 仅支持视频。
 
-参数：`q`（必填）、`media_type`（可选，`image` 或 `video`；不传时同时检索图片和视频）、`category`（可选）。
+参数：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `q` | string | 必填，搜索词 |
+| `media_type` | string | 可选，`image` 或 `video`；不传时同时检索图片和视频 |
+| `category` | string | 可选，仅过滤本地素材题材 |
+| `source` | string | 可选，`all`、`local` 或 `external`，默认 `all` |
+
+`source=local` 只执行 MySQL、Embedding 和 Qdrant 本地素材检索，不等待外部平台；`source=external` 只请求外部平台。首页采用两阶段加载，先请求 `source=local` 并展示内部卡片，再请求 `source=external` 追加外部卡片。调用方仍可省略 `source`，一次获取完整结果。
+
+```http
+GET /api/search?q=城市&source=local
+GET /api/search?q=城市&source=external
+GET /api/search?q=城市
+```
 
 响应通过 `groups.image.local`、`groups.image.external`、`groups.video.local`、`groups.video.external` 提供四组结果，同时保留扁平 `items` 兼容字段。返回项的 `source` 为 `local` 时包含 `asset`；为 `external` 时包含 `provider`、`external_id`、`title`、`preview_url`、`preview_content_url`、`source_page_url`、`score` 等字段。`preview_url` 用于列表缩略图，`preview_content_url` 用于站内大图或视频在线播放；预览不会写入 MySQL 或 MinIO。
 
@@ -159,7 +174,8 @@ curl -X POST http://localhost:8000/api/assets/upload -F "file=@./sample.jpg"
 
 ```text
 无搜索词       GET /api/assets
-有搜索词       GET /api/search
+有搜索词（首屏） GET /api/search?source=local
+有搜索词（补充） GET /api/search?source=external
 上传           POST /api/assets/upload
 外部素材浏览   GET /api/external-assets/search
 导入外部素材   POST /api/external-assets/import
