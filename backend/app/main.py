@@ -449,7 +449,16 @@ def unified_search(
         "mixkit": {"video"},
         "ibaotu": {"image", "video"},
     }
-    provider_order = {provider: index for index, provider in enumerate(searchers)}
+    # External image priority is provider-first. Keep each provider's native
+    # ranking, with licensed Baotu results shown before the other platforms.
+    provider_order = {
+        "ibaotu": 0,
+        "pexels": 1,
+        "pixabay": 2,
+        "unsplash": 3,
+        "openverse": 4,
+        "mixkit": 5,
+    }
     requested_types = [media_type] if media_type else ["image", "video"]
     started_at = time.perf_counter()
     local_groups = {"image": [], "video": []}
@@ -486,11 +495,17 @@ def unified_search(
                     external.append(item)
     external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
     external_images = [item for item in external if item.get("media_type") == "image"]
-    if external_images:
-        for item in external_images:
+    external_image_items = []
+    for provider in provider_order:
+        provider_images = [
+            item for item in external_images
+            if item.get("provider") == provider
+        ]
+        # The score is only the provider's original rank; no cross-provider
+        # semantic/vector re-ranking is performed for external results.
+        for item in provider_images[:20]:
             item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
-        external_images.sort(key=lambda item: (item["score"], -provider_order[item["provider"]]), reverse=True)
-    external_image_items = [{"source": "external", **item} for item in external_images[:30]]
+            external_image_items.append({"source": "external", **item})
 
     external_video_items = []
     for provider in searchers:

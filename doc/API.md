@@ -45,7 +45,7 @@ curl -X POST http://localhost:8000/api/assets/upload -F "file=@./sample.jpg"
 
 ### `GET /api/search`
 
-前端有搜索词时使用。结果按图片/视频、内部/外部分成四组，内部图片和内部视频分别按本地综合得分返回前 20 条。外部图片从每个平台最多召回 20 条，按平台原始排名合并后返回前 30 条；外部视频同样不做项目侧语义重排，每个支持视频的平台保留其站内顺序并返回前 10 条。Pexels、Pixabay、包图网支持图片和视频，Unsplash、Openverse 仅支持图片，Mixkit 仅支持视频。
+前端有搜索词时使用。结果按图片/视频、内部/外部分成四组，内部图片和内部视频分别按本地综合得分返回前 20 条。外部图片不做项目侧 Embedding 或语义重排，按包图网、Pexels、Pixabay、Unsplash、Openverse、Mixkit 的固定平台优先级依次拼接，每个平台保留站内原始顺序并最多返回 20 条；外部视频同样不做项目侧语义重排，每个支持视频的平台保留其站内顺序并返回前 10 条。Pexels、Pixabay、包图网支持图片和视频，Unsplash、Openverse 仅支持图片，Mixkit 仅支持视频。
 
 参数：
 
