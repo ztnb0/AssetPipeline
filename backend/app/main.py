@@ -220,7 +220,7 @@ def search_external_assets(
     provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit|ibaotu)$"),
     media_type: str = Query(default="image", pattern="^(image|video)$"),
     page: int = Query(default=1, ge=1, le=100),
-    per_page: int = Query(default=12, ge=1, le=40),
+    per_page: int = Query(default=12, ge=1, le=20),
 ):
     try:
         searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
@@ -444,15 +444,9 @@ def _cosine_similarity(left: tuple[float, ...] | list[float], right: list[float]
 def _rank_external_images(query: str, images: list[dict]) -> list[dict]:
     if not images:
         return []
-    documents = [
-        "\n".join((
-            f"素材类型：图片",
-            f"标题：{item.get('title', '')}",
-            f"作者：{item.get('author', '')}",
-            f"来源：{item.get('provider', '')}",
-        ))
-        for item in images
-    ]
+    # Provider adapters enrich title with any useful tags/descriptions they
+    # expose. Only that user-facing title participates in semantic ranking.
+    documents = [str(item.get("title") or "") for item in images]
     query_vector = embed_query(query)
     image_vectors = embed_texts(documents)
     ranked = [
@@ -472,7 +466,9 @@ def unified_search(
     db: Session = Depends(get_db),
 ):
     """Search local assets and external providers without importing external files."""
-    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
+    # Pixabay and Mixkit remain available through /api/external-assets/search,
+    # but are intentionally excluded from the homepage mixed search.
+    searchers = {"pexels": search_pexels, "unsplash": search_unsplash, "openverse": search_openverse, "ibaotu": search_ibaotu}
     provider_media = {
         "pexels": {"image", "video"},
         "pixabay": {"image", "video"},

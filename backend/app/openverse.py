@@ -46,7 +46,15 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
         "provider": "openverse",
         "external_id": item["id"],
         "media_type": "image",
-        "title": item.get("title") or f"Openverse 图片 {item['id']}",
+        "title": " · ".join(dict.fromkeys(filter(None, (
+            item.get("title"),
+            item.get("description"),
+            ", ".join(
+                str(tag.get("name") if isinstance(tag, dict) else tag).strip()
+                for tag in (item.get("tags") or [])
+                if str(tag.get("name") if isinstance(tag, dict) else tag).strip()
+            ),
+        )))) or f"Openverse 图片 {item['id']}",
         "preview_url": item.get("thumbnail", ""),
         "preview_content_url": item.get("url") or item.get("thumbnail", ""),
         "author": item.get("creator") or "",

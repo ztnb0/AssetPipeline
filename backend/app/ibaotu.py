@@ -112,11 +112,18 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
         content = _absolute_url(item.get("preview_url") or item.get("url")) if media_type == "video" else thumbnail
         if not external_id or not thumbnail:
             continue
+        title_parts = [item.get("title"), item.get("description")]
+        raw_tags = item.get("tags") or item.get("keywords")
+        if isinstance(raw_tags, list):
+            title_parts.append(", ".join(str(tag).strip() for tag in raw_tags if str(tag).strip()))
+        elif raw_tags:
+            title_parts.append(str(raw_tags).strip())
+        enriched_title = " · ".join(dict.fromkeys(str(part).strip() for part in title_parts if str(part or "").strip()))
         items.append({
             "provider": "ibaotu",
             "external_id": external_id,
             "media_type": media_type,
-            "title": (item.get("title") or f"包图网素材 {external_id}").strip(),
+            "title": enriched_title or f"包图网素材 {external_id}",
             "preview_url": thumbnail,
             "preview_content_url": content or thumbnail,
             "author": item.get("flag") or "包图网",

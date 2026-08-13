@@ -44,7 +44,10 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
         "provider": "unsplash",
         "external_id": item["id"],
         "media_type": "image",
-        "title": item.get("alt_description") or item.get("description") or f"Unsplash 图片 {item['id']}",
+        "title": " · ".join(dict.fromkeys(filter(None, (
+            item.get("alt_description"),
+            item.get("description"),
+        )))) or f"Unsplash 图片 {item['id']}",
         "preview_url": item.get("urls", {}).get("small", ""),
         "preview_content_url": item.get("urls", {}).get("full") or item.get("urls", {}).get("regular"),
         "author": item.get("user", {}).get("name", ""),

@@ -1,8 +1,11 @@
 import re
+from functools import lru_cache
 from urllib.parse import quote
 
+import httpx
 from scrapling.fetchers import Fetcher
 
+from .config import settings
 from .external_download import ExternalDownloadError, download as safe_download
 
 
@@ -33,10 +36,55 @@ def _text(element, selector: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+def _is_english_query(query: str) -> bool:
+    return not re.search(r"[^\x00-\x7f]", query)
+
+
+@lru_cache(maxsize=256)
+def _translate_query(query: str) -> str:
+    query = query.strip()
+    if _is_english_query(query):
+        return query
+    headers = {"Content-Type": "application/json"}
+    if settings.vision_api_key:
+        headers["Authorization"] = f"Bearer {settings.vision_api_key}"
+    payload = {
+        "model": settings.vision_model,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Translate the following stock-video search query into concise English keywords. "
+                "Output only the English keywords. Do not output JSON, quotes, labels, or explanation.\n"
+                f"Query: {query}"
+            ),
+        }],
+        "temperature": 0.0,
+        "max_tokens": 80,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.post(
+                f"{settings.vision_api_base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+        translated = response.json()["choices"][0]["message"]["content"].strip()
+        translated = translated.removeprefix("```").removesuffix("```").strip().strip('"\'')
+        translated = re.sub(r"[^a-zA-Z0-9\s-]+", " ", translated)
+        translated = re.sub(r"\s+", " ", translated).strip()
+        if not translated:
+            raise ValueError("translation is empty")
+        return translated
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        raise MixkitError("Mixkit 中文检索翻译失败，请改用英文关键词重试") from exc
+
+
 def _slug(query: str) -> str:
-    value = re.sub(r"[^a-z0-9]+", "-", query.strip().lower()).strip("-")
+    value = re.sub(r"[^a-z0-9]+", "-", _translate_query(query).lower()).strip("-")
     if not value:
-        raise MixkitError("Mixkit 目前仅支持英文关键词搜索")
+        raise MixkitError("Mixkit 检索词翻译后没有可用的英文关键词")
     return quote(value, safe="-")
 
 
