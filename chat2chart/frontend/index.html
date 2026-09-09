@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>chat2chart · 一句话生成数据图表</title>
+<style>
+  :root{--bg:#F0EFEB;--ink:#1C1C1A;--muted:#8F8E88;--faint:#C6C5BF;--grid:#DEDDD6;--accent:#1C1C1A}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);font-family:'Inter','PingFang SC','Microsoft YaHei',sans-serif;
+    padding:36px 20px 80px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1060px;margin:0 auto}
+  header h1{font-size:22px;letter-spacing:-.02em;font-weight:800}
+  header p{font-size:12.5px;color:var(--muted);margin-top:6px;line-height:1.8}
+  .panel{background:#fff;border:1px solid var(--grid);border-radius:18px;padding:22px;margin-top:22px}
+  label{display:block;font-size:12px;font-weight:700;margin-bottom:8px;color:#55554F}
+  textarea,input[type=text],input[type=number]{width:100%;border:1px solid #C9C8C1;border-radius:12px;padding:12px 14px;
+    font-size:14px;font-family:inherit;background:#fff;color:var(--ink);outline:none}
+  textarea{min-height:96px;resize:vertical}
+  textarea:focus,input:focus{border-color:var(--ink)}
+  .row{display:flex;gap:12px;align-items:flex-start;margin-top:14px;flex-wrap:wrap}
+  .field{flex:1;min-width:260px}
+  .field.slim{flex:0 0 auto;min-width:0}
+  .toggle{display:flex;align-items:center;gap:8px;font-size:13px;color:#55554F;margin-top:10px;font-weight:600;cursor:pointer;user-select:none}
+  .toggle input{width:16px;height:16px;accent-color:var(--ink)}
+  .btn{border:0;border-radius:12px;background:var(--accent);color:#fff;font-size:14px;font-weight:700;
+    padding:12px 22px;cursor:pointer;margin-top:14px}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn.ghost{background:#fff;color:var(--ink);border:1px solid #B0AFA9}
+  .chips{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+  .chip{font-size:12px;color:#55554F;background:#fff;border:1px solid var(--grid);border-radius:99px;
+    padding:6px 12px;cursor:pointer;user-select:none}
+  .chip:hover{border-color:var(--ink)}
+  .modes{display:flex;gap:8px;margin-bottom:16px}
+  .mode{border:1px solid var(--grid);background:#fff;color:#55554F;border-radius:99px;padding:8px 16px;
+    font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+  .mode.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .status{margin-top:14px;font-size:13px;color:var(--muted);display:none}
+  .status .dot{display:inline-block;width:8px;height:8px;border-radius:99px;background:#B0AFA9;margin-right:6px}
+  .status.running .dot{background:#D4A017;animation:blink 1s infinite}
+  .status.done .dot{background:#43593B}
+  .status.failed .dot{background:#C0392B}
+  @keyframes blink{50%{opacity:.25}}
+  .status .elapsed{margin-left:10px;font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums}
+  .cost{font-size:12.5px;color:var(--muted);margin-right:14px}
+  .cost b{color:var(--ink);font-weight:800;font-variant-numeric:tabular-nums}
+  details{margin-top:14px;font-size:12px;color:var(--muted)}
+  details summary{cursor:pointer;font-weight:600}
+  pre{white-space:pre-wrap;word-break:break-word;margin-top:8px;background:#fff;border:1px solid var(--grid);
+    border-radius:10px;padding:10px;max-height:260px;overflow:auto;font-family:Consolas,monospace;font-size:11.5px}
+  .preview{margin-top:24px;display:none}
+  .preview.on{display:block}
+  .preview .bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .preview iframe{width:100%;height:640px;border:1px solid var(--grid);border-radius:14px;background:#fff}
+  .preview video{width:100%;max-height:640px;border:1px solid var(--grid);border-radius:14px;background:#000}
+  .meta{font-size:12px;color:var(--muted);margin-top:18px;line-height:1.8}
+  code{background:#fff;border:1px solid var(--grid);border-radius:5px;padding:1px 5px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>chat2chart · 一句话生成数据图表</h1>
+    <p>输入想画的图（会真的去 AKShare 等来源取数）。两种模式：<b>HTML 图表</b>（lieflat-charts 规范）或 <b>Remotion 视频动画</b>。示例：<b>对比中美近几年的黄金储备量</b></p>
+  </header>
+
+  <section class="panel">
+    <div class="modes" id="modes">
+      <button class="mode on" id="modeChart" type="button">HTML 图表</button>
+      <button class="mode" id="modeVideo" type="button">Remotion 视频动画</button>
+    </div>
+    <label for="prompt">想画什么？</label>
+    <textarea id="prompt" placeholder="例如：对比中美近几年的黄金储备量">对比中美近几年的黄金储备量</textarea>
+    <div class="row">
+      <div class="field" id="extraField">
+        <label for="extra">附加要求（可选）</label>
+        <input id="extra" type="text" placeholder="例如：用彩色 Lupi 风格，做 2 张" value="" />
+      </div>
+      <div style="flex:0 0 auto">
+        <label style="visibility:hidden">生成</label>
+        <button class="btn" id="go">生成图表</button>
+      </div>
+    </div>
+    <div class="row" id="animRow">
+      <div class="field slim">
+        <label for="animSec" id="animSecLabel">展示时长（秒）</label>
+        <input id="animSec" type="number" min="2" max="300" step="1" value="8" style="width:120px" />
+      </div>
+      <div class="field slim">
+        <label>展示方式</label>
+        <label class="toggle"><input type="checkbox" id="animLoop" /> <span id="animLoopLabel">动画结束后循环重播</span></label>
+      </div>
+    </div>
+    <div class="chips" id="chips">
+      <div class="chip">对比中美近几年的黄金储备量</div>
+      <div class="chip">中国最近十年 GDP 总量走势</div>
+      <div class="chip">近两年美元兑人民币汇率月度变化</div>
+      <div class="chip">近五年中国CPI同比月度走势</div>
+    </div>
+    <div class="status" id="status"><span class="dot"></span><span id="statusText"></span><span class="elapsed" id="elapsed"></span></div>
+    <details id="logBox">
+      <summary>查看 Agent 运行日志</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+
+  <section class="preview" id="preview">
+    <div class="bar">
+      <strong>生成结果</strong>
+      <span>
+        <span class="cost" id="cost"></span>
+        <a class="btn ghost" id="download" download="chart.html">下载 HTML</a>
+        <button class="btn ghost" id="again">再生成一张</button>
+      </span>
+    </div>
+    <iframe id="frame" title="图表预览"></iframe>
+    <video id="video" controls style="display:none"></video>
+  </section>
+
+  <p class="meta">
+    说明：点击生成后，后端会为本任务创建独立工作目录并调用 <code>opencode run</code>（Agent 模式）。
+    HTML 图表模式复用 lieflat-charts 技能出图；视频模式则让 Agent 按 Remotion 官方技能写组合代码，再由后端用
+    <code>npx remotion render</code> 渲染成 1080p MP4。两种模式都会去 AKShare 取数，通常需要 30 秒到几分钟、会消耗模型额度。
+  </p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SAMPLES = ['对比中美近几年的黄金储备量','中国最近十年 GDP 总量走势','近两年美元兑人民币汇率月度变化','近五年中国CPI同比月度走势'];
+let t0 = null, tick = null;
+let mode = 'chart';
+
+function setMode(m){
+  mode = m;
+  $('modeChart').className = 'mode' + (m === 'chart' ? ' on' : '');
+  $('modeVideo').className = 'mode' + (m === 'video' ? ' on' : '');
+  const isVideo = m === 'video';
+  $('extraField').style.display = isVideo ? 'none' : '';
+  $('animRow').style.display = isVideo ? 'none' : '';
+  $('chips').style.display = isVideo ? 'none' : '';
+  $('go').textContent = isVideo ? '生成视频' : '生成图表';
+  $('download').textContent = isVideo ? '下载 MP4' : '下载 HTML';
+  $('download').setAttribute('download', isVideo ? 'video.mp4' : 'chart.html');
+}
+
+function fmt(ms){
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const p = n => String(n).padStart(2, '0');
+  return (h ? p(h) + ':' : '') + p(m) + ':' + p(sec);
+}
+
+function startTimer(){
+  if(tick) clearInterval(tick);
+  t0 = Date.now();
+  $('elapsed').textContent = '';
+  $('cost').innerHTML = '';
+  tick = setInterval(() => {
+    $('elapsed').textContent = '已用时 ' + fmt(Date.now() - t0);
+  }, 1000);
+}
+
+function stopTimer(){
+  if(tick) clearInterval(tick);
+  tick = null;
+  if(t0 != null) $('elapsed').textContent = '耗时 ' + fmt(Date.now() - t0);
+}
+
+function setCost(){
+  if(t0 != null) $('cost').innerHTML = '生成耗时 <b>' + fmt(Date.now() - t0) + '</b>';
+}
+
+$('chips').querySelectorAll('.chip').forEach(c =>
+  c.addEventListener('click', () => { $('prompt').value = c.textContent; }));
+
+$('modeChart').addEventListener('click', () => setMode('chart'));
+$('modeVideo').addEventListener('click', () => setMode('video'));
+
+function setStatus(state, text){
+  const s = $('status');
+  s.className = 'status ' + state;
+  s.style.display = 'block';
+  $('statusText').textContent = text;
+}
+
+function renderLog(job){
+  const lines = (job.log_tail || []);
+  $('log').textContent = lines.join('\n');
+}
+
+async function startJob(){
+  const prompt = $('prompt').value.trim();
+  if(!prompt){ alert('请先输入要画的图'); return; }
+  const extra = mode === 'chart' ? $('extra').value.trim() : '';
+  let animSec = parseInt($('animSec').value, 10);
+  if(!animSec || animSec < 2) animSec = 8;
+  const animLoop = $('animLoop').checked;
+  $('go').disabled = true;
+  $('preview').className = 'preview';
+  startTimer();
+  setStatus('running', mode === 'video' ? '正在排队/生成视频中…请耐心等待（Agent 会取数并写 Remotion 组合代码，再由后端渲染）' : '正在排队/生成中…请耐心等待（首次任务含技能与数据准备可能较慢）');
+
+  const body = { prompt, extra, mode };
+  if(mode === 'chart'){
+    body.anim_seconds = animSec;
+    body.anim_loop = animLoop;
+  }
+
+  let res = await fetch('/api/jobs', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  if(!res.ok){ stopTimer(); setStatus('failed', '创建任务失败：HTTP ' + res.status); $('go').disabled = false; return; }
+  const { id } = await res.json();
+  pollJob(id);
+}
+
+async function pollJob(id){
+  const timer = setInterval(async () => {
+    try{
+      const res = await fetch('/api/jobs/' + id);
+      if(!res.ok){ clearInterval(timer); stopTimer(); setStatus('failed', '查询任务失败：HTTP ' + res.status); $('go').disabled = false; return; }
+      const job = await res.json();
+      renderLog(job);
+      if(job.status === 'running' || job.status === 'queued'){
+        if(job.status === 'queued'){
+          setStatus('running', '排队中…');
+        }else if(job.mode === 'video'){
+          setStatus('running', 'Agent 正在取数、写 Remotion 组合代码…（可展开下方日志看进度）');
+        }else{
+          setStatus('running', 'Agent 正在取数、设计并出图…（可展开下方日志看进度）');
+        }
+        return;
+      }
+      clearInterval(timer);
+      if(job.status === 'done' && (job.chart_url || job.video_url)){
+        stopTimer();
+        setCost();
+        setStatus('done', '完成 ✓ ' + (job.video_url ? '视频已生成。' : '图表已生成。'));
+        $('preview').className = 'preview on';
+        if(job.video_url){
+          $('frame').style.display = 'none';
+          $('video').style.display = 'block';
+          $('video').src = job.video_url;
+          $('download').href = job.video_url;
+        }else{
+          $('video').style.display = 'none';
+          $('frame').style.display = 'block';
+          $('frame').src = job.chart_url;
+          $('download').href = job.chart_url;
+        }
+        return;
+      }
+      stopTimer();
+      setStatus('failed', '生成失败：' + (job.error || '未知错误'));
+      $('go').disabled = false;
+    }catch(e){
+      clearInterval(timer);
+      stopTimer();
+      setStatus('failed', '网络错误：' + e.message);
+      $('go').disabled = false;
+    }
+  }, 2000);
+}
+
+$('go').addEventListener('click', startJob);
+$('again').addEventListener('click', () => { $('go').disabled = false; startJob(); });
+</script>
+</body>
+</html>

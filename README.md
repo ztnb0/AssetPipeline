@@ -105,6 +105,7 @@ AI Video Factory 第一阶段的素材资产中心 Demo。该模块用于统一�
    - API 文档：http://localhost:8000/docs
    - 后端健康检查：http://localhost:8000/health
    - MinIO 控制台：http://localhost:9101
+   - Qdrant： `http://localhost:6333/dashboard `
 
 ## 日常运维命令
 
@@ -196,6 +197,7 @@ curl.exe -X POST "http://localhost:8000/api/assets/upload" `
 
 ```http
 GET /api/external-assets/search?provider=openverse&q=stock%20exchange&media_type=image
+GET /api/external-assets/search?provider=mixkit&q=nature&media_type=video
 POST /api/external-assets/import
 ```
 
@@ -206,6 +208,8 @@ POST /api/external-assets/import
 导入成功后，系统将原始素材保存到 MinIO，在 MySQL 中创建本地素材记录，并在后台自动生成描述、场景、题材分类和标签。分析成功后，素材状态变为 `ready`，同时写入 Qdrant 语义向量索引。
 
 首页输入语义搜索词时会同时展示本地素材和外部素材。外部素材卡片带有“导入素材库”按钮，点击后会直接调用 `POST /api/external-assets/import`；导入成功后，当前卡片会替换为本地素材并显示 AI 分析状态。同一 provider 和素材 ID 重复导入时，后端返回已有的本地素材，不会重复保存文件。
+
+Mixkit 通过 Scrapling 读取公开的视频搜索页和详情页，当前仅支持英文关键词与视频素材。搜索阶段只展示远程缩略图；用户点击“导入素材库”后，后端才按 Mixkit Stock Video Free License 获取不超过 1080p 的视频文件。
 
 > FRED 图表接口当前已停用，`GET /api/fred/series` 和 `POST /api/fred/charts` 返回 `410 Gone`。
 

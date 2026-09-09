@@ -1,0 +1,200 @@
+{
+  "$comment": "RemotionUI 已安装组件清单（供 Agent 查阅）。import 用 @/ 别名（@ -> src/）。用法以组件实际源码为准。",
+  "alias": "@",
+  "sharedTypes": {
+    "ChartDatum": {
+      "import": "@/remotion/lib/chart-utils",
+      "shape": "{ label: string; value: number; color?: string; delta?: string }"
+    },
+    "ChartPoint": {
+      "import": "@/remotion/lib/chart-utils",
+      "shape": "{ x: number; y: number; label?: string }"
+    }
+  },
+  "components": [
+    {
+      "name": "animated-bar-chart",
+      "importPath": "@/remotion/scenes/animated-bar-chart",
+      "export": "AnimatedBarChart",
+      "category": "chart",
+      "description": "柱状图（含标题/副标题/坐标轴，整页场景）",
+      "props": "data: ChartDatum[]; title?; subtitle?; maxValue?; valueFormatter?; highlightLabel?; showAxis?; maxBars?"
+    },
+    {
+      "name": "line-chart-draw",
+      "importPath": "@/remotion/primitives/line-chart-draw",
+      "export": "LineChartDraw",
+      "category": "chart",
+      "description": "折线图（手绘式描线动画）",
+      "props": "points: ChartPoint[]; width?; height?; color?; strokeWidth?; variant?('smooth'|'linear'); showAxis?; showXLabels?"
+    },
+    {
+      "name": "donut-chart",
+      "importPath": "@/remotion/primitives/donut-chart",
+      "export": "DonutChart",
+      "category": "chart",
+      "description": "环形图（占比，可显示中心总数与图例）",
+      "props": "segments: ChartDatum[]; size?; thickness?; colors?; showLegend?; showTotal?; totalLabel?"
+    },
+    {
+      "name": "pie-slice-reveal",
+      "importPath": "@/remotion/primitives/pie-slice-reveal",
+      "export": "PieSliceReveal",
+      "category": "chart",
+      "description": "饼图（扇区逐个揭示）",
+      "props": "slices: ChartDatum[]; size?; colors?; showLabels?; explode?; gapInDegrees?"
+    },
+    {
+      "name": "stacked-area-chart",
+      "importPath": "@/remotion/primitives/stacked-area-chart",
+      "export": "StackedAreaChart",
+      "category": "chart",
+      "description": "堆叠面积图（多序列构成随时间变化）",
+      "props": "series: StackedSeries[]; labels?; width?; height?; durationInFrames?"
+    },
+    {
+      "name": "funnel-chart",
+      "importPath": "@/remotion/primitives/funnel-chart",
+      "export": "FunnelChart",
+      "category": "chart",
+      "description": "漏斗图（阶段递减，如转化漏斗）",
+      "props": "stages: FunnelStage[]; width?; height?; durationInFrames?"
+    },
+    {
+      "name": "waterfall-chart",
+      "importPath": "@/remotion/primitives/waterfall-chart",
+      "export": "WaterfallChart",
+      "category": "chart",
+      "description": "瀑布图（增减分解）",
+      "props": "steps: WaterfallStep[]; width?; height?; durationInFrames?"
+    },
+    {
+      "name": "gauge-dial",
+      "importPath": "@/remotion/primitives/gauge-dial",
+      "export": "GaugeDial",
+      "category": "chart",
+      "description": "仪表盘（单值指针扫动）",
+      "props": "value: number; min?; max?; size?; thickness?; sweepInDegrees?; color?; trackColor?"
+    },
+    {
+      "name": "treemap-blocks",
+      "importPath": "@/remotion/primitives/treemap-blocks",
+      "export": "TreemapBlocks",
+      "category": "chart",
+      "description": "矩形树图（层级份额）",
+      "props": "blocks: ChartDatum[]; width?; height?; colors?; gap?; cornerRadius?; showShare?"
+    },
+    {
+      "name": "sparkline-row",
+      "importPath": "@/remotion/primitives/sparkline-row",
+      "export": "SparklineRow",
+      "category": "chart",
+      "description": "迷你走势行（一行一指标，带涨跌标注）",
+      "props": "values: number[]; label?; value?; delta?; color?; width?; durationInFrames?"
+    },
+    {
+      "name": "candlestick-chart",
+      "importPath": "@/remotion/primitives/candlestick-chart",
+      "export": "CandlestickChart",
+      "category": "chart",
+      "description": "K 线图（OHLC 行情，可加均线）",
+      "props": "candles: Candle[]; width?; height?; upColor?; downColor?; showAxis?; movingAverage?; showLastPrice?"
+    },
+    {
+      "name": "radar-chart",
+      "importPath": "@/remotion/primitives/radar-chart",
+      "export": "RadarChart",
+      "category": "chart",
+      "description": "雷达图（多维度对比）",
+      "props": "axes: string[]; series: RadarSeries[]; durationInFrames?"
+    },
+    {
+      "name": "bar-chart-race",
+      "importPath": "@/remotion/primitives/bar-chart-race",
+      "export": "BarChartRace",
+      "category": "chart",
+      "description": "动态排名条形图（bar chart race）",
+      "props": "series: RaceSeries[]; steps?; durationInFrames?"
+    },
+    {
+      "name": "comparison-bars",
+      "importPath": "@/remotion/primitives/comparison-bars",
+      "export": "ComparisonBars",
+      "category": "chart",
+      "description": "前后对比条形图（before/after 双条）",
+      "props": "rows: ComparisonRowDatum[]; width?; rowHeight?; gap?; labelWidth?"
+    },
+    {
+      "name": "counter",
+      "importPath": "@/remotion/primitives/counter",
+      "export": "Counter",
+      "category": "data",
+      "description": "数字滚动计数（千分位/小数/里程表式滚动）",
+      "props": "to: number; from?; durationInFrames?; decimals?; grouping?; locale?; format?; prefix?; suffix?; roll?"
+    },
+    {
+      "name": "progress-bar",
+      "importPath": "@/remotion/primitives/progress-bar",
+      "export": "ProgressBar",
+      "category": "data",
+      "description": "进度条（0-1 填充）",
+      "props": "progress?; from?; durationInFrames?; delayInFrames?; spring?; color?; height?"
+    },
+    {
+      "name": "stat-card",
+      "importPath": "@/remotion/scenes/stat-card",
+      "export": "StatCard",
+      "category": "data",
+      "description": "统计卡片（大数字 + 环形仪表 + 涨跌 chip）",
+      "props": "value?; max?; suffix?; prefix?; decimals?; label?; caption?; delta?"
+    },
+    {
+      "name": "fade-in",
+      "importPath": "@/remotion/primitives/fade-in",
+      "export": "FadeIn",
+      "category": "motion",
+      "description": "淡入（可带 exit 淡出）",
+      "props": "children; durationInFrames?; delayInFrames?; spring?; exit?; from?; to?"
+    },
+    {
+      "name": "slide-up",
+      "importPath": "@/remotion/primitives/slide-up",
+      "export": "SlideUp",
+      "category": "motion",
+      "description": "上滑进入（可 mask 揭示）",
+      "props": "children; durationInFrames?; delayInFrames?; distance?; mask?; spring?; exit?"
+    },
+    {
+      "name": "scale-in",
+      "importPath": "@/remotion/primitives/scale-in",
+      "export": "ScaleIn",
+      "category": "motion",
+      "description": "缩放进入",
+      "props": "children; durationInFrames?; from?; origin?; spring?; exit?"
+    },
+    {
+      "name": "spring-in",
+      "importPath": "@/remotion/primitives/spring-in",
+      "export": "SpringIn",
+      "category": "motion",
+      "description": "弹簧进入（smooth/snappy/bouncy 预设）",
+      "props": "children; durationInFrames?; config?('smooth'|'snappy'|'bouncy'); from?; travel?; exit?"
+    },
+    {
+      "name": "stagger-children",
+      "importPath": "@/remotion/primitives/stagger-children",
+      "export": "StaggerChildren",
+      "category": "motion",
+      "description": "子元素错峰进入（forward/reverse/center/edges）",
+      "props": "children; order?; staggerInFrames?; durationInFrames?"
+    },
+    {
+      "name": "typewriter",
+      "importPath": "@/remotion/primitives/typewriter",
+      "export": "Typewriter",
+      "category": "motion",
+      "description": "打字机文字揭示（支持 [pause:x]、光标、循环）",
+      "props": "text: string; charFrames?; durationInFrames?; humanize?; showCursor?; loop?; fontSize?; color?"
+    }
+  ]
+}

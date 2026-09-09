@@ -3,8 +3,12 @@ import logging
 import threading
 import time
 import uuid
+import re
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +24,23 @@ from .openverse import OpenverseError, download as download_openverse, get_downl
 from .pexels import PexelsError, download as download_pexels, get_download as get_pexels_download, search as search_pexels
 from .pixabay import PixabayError, download as download_pixabay, get_download as get_pixabay_download, search as search_pixabay
 from .processor import process_asset
-from .schemas import AssetList, AssetOut, AssetUpdate, ExternalAssetImport, ExternalAssetList, FredChartCreate
+from .media_export import export_asset
+from .mixkit import MixkitError, download as download_mixkit, get_download as get_mixkit_download, search as search_mixkit
+from .schemas import (
+    AssetBatchDelete,
+    AssetBatchDeleteResult,
+    AssetExportRequest,
+    AssetList,
+    AssetOut,
+    AssetUpdate,
+    ExternalAssetImport,
+    ExternalAssetList,
+    FredChartCreate,
+)
 from .semantic import expand_from_assets, expand_query
-from .storage import delete_object, ensure_bucket, get_object, move_object, put_bytes
+from .storage import delete_object, delete_prefix, ensure_bucket, get_object, move_object, put_bytes
 from .unsplash import UnsplashError, download as download_unsplash, get_download as get_unsplash_download, search as search_unsplash
-from .vector_store import reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
+from .vector_store import embed_texts, reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
 
 
 ALLOWED_TYPES = {
@@ -41,6 +57,7 @@ EXTENSION_TYPES = {
     ".ogg": ("audio", "audio/ogg"),
 }
 logger = logging.getLogger(__name__)
+FORMAT_EXPORT_ENABLED = False
 
 
 @asynccontextmanager
@@ -163,6 +180,8 @@ async def upload_asset(
     fallback = EXTENSION_TYPES.get(suffix)
     media_type = ALLOWED_TYPES.get(file.content_type or "") or (fallback[0] if fallback else None)
     mime_type = file.content_type if file.content_type in ALLOWED_TYPES else (fallback[1] if fallback else "")
+    if media_type == "audio":
+        raise HTTPException(410, "音频接口暂时停用")
     if not media_type:
         raise HTTPException(415, "支持 JPG、PNG、WebP、MP4、MOV、MKV、WebM、MP3、WAV、M4A、FLAC 和 OGG")
     data = await file.read()
@@ -180,15 +199,15 @@ async def upload_asset(
 @app.get("/api/external-assets/search", response_model=ExternalAssetList)
 def search_external_assets(
     q: str = Query(min_length=1, max_length=100),
-    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse)$"),
+    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit)$"),
     media_type: str = Query(default="image", pattern="^(image|video)$"),
     page: int = Query(default=1, ge=1, le=100),
     per_page: int = Query(default=12, ge=1, le=40),
 ):
     try:
-        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse}
+        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
         return searchers[provider](q.strip(), media_type, page, per_page)
-    except (PexelsError, PixabayError, UnsplashError, OpenverseError) as exc:
+    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError) as exc:
         raise HTTPException(503, str(exc)) from exc
 
 
@@ -210,13 +229,14 @@ def import_external_asset(
             "pixabay": (get_pixabay_download, download_pixabay, PixabayError, "Pixabay Content License"),
             "unsplash": (get_unsplash_download, download_unsplash, UnsplashError, "Unsplash License"),
             "openverse": (get_openverse_download, download_openverse, OpenverseError, None),
+            "mixkit": (get_mixkit_download, download_mixkit, MixkitError, "Mixkit Stock Video Free License"),
         }
         get_download, download, error_type, license_name = providers[payload.provider]
         source = get_download(payload.external_id, payload.media_type)
         if not source.get("url"):
             raise error_type("该素材没有可用下载地址")
         data = download(source["url"], settings.max_upload_mb * 1024 * 1024)
-    except (PexelsError, PixabayError, UnsplashError, OpenverseError) as exc:
+    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
     asset = _create_asset(
@@ -235,7 +255,7 @@ def import_external_asset(
 
 @app.get("/api/fred/series")
 def fred_series():
-    return {"items": list_fred_series()}
+    raise HTTPException(410, "财经图表接口暂时停用")
 
 
 @app.post("/api/fred/charts", response_model=AssetOut, status_code=202)
@@ -244,6 +264,7 @@ def create_fred_chart(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    raise HTTPException(410, "财经图表接口暂时停用")
     try:
         chart = generate_fred_chart(payload.series_id, payload.years)
     except FredError as exc:
@@ -274,8 +295,12 @@ def list_assets(
 ):
     base_filters = []
     query_terms = []
+    if media_type == "audio":
+        raise HTTPException(410, "音频接口暂时停用")
     if media_type:
         base_filters.append(Asset.media_type == media_type)
+    elif q.strip():
+        base_filters.append(Asset.media_type.in_(("image", "video")))
     if category:
         base_filters.append(cast(Asset.categories, String).like(f'%"{category}"%'))
 
@@ -332,8 +357,8 @@ def list_assets(
         }
         assets.sort(key=lambda asset: (combined_scores[asset.id], asset.created_at), reverse=True)
         return AssetList(
-            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:100]],
-            total=len(assets),
+            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:10]],
+            total=min(len(assets), 10),
             query_terms=query_terms,
         )
 
@@ -344,6 +369,69 @@ def list_assets(
     return AssetList(items=[serialize(item) for item in items], total=total, query_terms=query_terms)
 
 
+def _normalized_page_url(url: str) -> str:
+    value = (url or "").strip().lower().split("#", 1)[0]
+    value = re.sub(r"[?&](utm_[^=&]+|fbclid|gclid)=[^&]*", "", value)
+    return value.rstrip("/?")
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    norm_left = math.sqrt(sum(value * value for value in left))
+    norm_right = math.sqrt(sum(value * value for value in right))
+    return dot / (norm_left * norm_right) if norm_left and norm_right else 0.0
+
+
+@app.get("/api/search")
+def unified_search(
+    q: str = Query(min_length=1, max_length=100),
+    media_type: str | None = Query(default=None, pattern="^(image|video)$"),
+    category: str | None = Query(default=None, max_length=80),
+    db: Session = Depends(get_db),
+):
+    """Search local assets and external providers without importing external files."""
+    local = list_assets(q=q, media_type=media_type, category=category, db=db)
+    local_items = [{"source": "local", "asset": item, "score": item.search_score or 0.0} for item in local.items[:10]]
+    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
+    requested_types = [media_type] if media_type else ["image", "video"]
+    external: list[dict] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(searcher, q.strip(), requested_type, 1, 10): (provider, requested_type)
+            for provider, searcher in searchers.items()
+            for requested_type in requested_types
+        }
+        for future in as_completed(futures):
+            provider, _requested_type = futures[future]
+            try:
+                result = future.result()
+            except Exception:
+                logger.warning("External search failed for %s", provider, exc_info=True)
+                continue
+            for rank, item in enumerate(result.get("items", []), start=1):
+                item = {**item, "provider_rank": rank}
+                item["source"] = "external"
+                external.append(item)
+    external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
+    try:
+        query_vector = embed_texts([q], query=True)[0]
+        texts = [" ".join(str(item.get(key) or "") for key in ("title", "author", "media_type")) for item in external]
+        vectors = embed_texts(texts)
+        for item, vector in zip(external, vectors, strict=True):
+            semantic_score = max(0.0, min(1.0, _cosine(query_vector, vector)))
+            rank_score = 1.0 - ((item["provider_rank"] - 1) / 9)
+            item["score"] = round(0.85 * semantic_score + 0.15 * rank_score, 6)
+    except Exception:
+        logger.warning("External embedding unavailable; using provider rank", exc_info=True)
+        for item in external:
+            item["score"] = round(1.0 - ((item["provider_rank"] - 1) / 9), 6)
+    external_items = [{"provider": item.pop("provider", None), **item} for item in external]
+    external_items.sort(key=lambda item: item["score"], reverse=True)
+    results = local_items + external_items[:20]
+    results.sort(key=lambda item: item["score"], reverse=True)
+    return {"items": results[:30], "total": min(len(results), 30), "query": q, "media_type": media_type}
+
+
 @app.get("/api/assets/{asset_id}", response_model=AssetOut)
 def get_asset(asset_id: str, db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
@@ -352,10 +440,12 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
     return serialize(asset)
 
 
-def stream_key(key: str):
+def stream_key(key: str, headers: dict[str, str] | None = None):
     response = get_object(key)
     return StreamingResponse(
-        response["Body"].iter_chunks(), media_type=response.get("ContentType", "application/octet-stream")
+        response["Body"].iter_chunks(),
+        media_type=response.get("ContentType", "application/octet-stream"),
+        headers=headers,
     )
 
 
@@ -373,6 +463,30 @@ def asset_thumbnail(asset_id: str, db: Session = Depends(get_db)):
     if not asset or not asset.thumbnail_key:
         raise HTTPException(404, "缩略图不存在")
     return stream_key(asset.thumbnail_key)
+
+
+@app.post("/api/assets/{asset_id}/export")
+def export_asset_download(asset_id: str, payload: AssetExportRequest, db: Session = Depends(get_db)):
+    if not FORMAT_EXPORT_ENABLED:
+        raise HTTPException(410, "比例裁剪下载功能暂未开放")
+    asset = db.get(Asset, asset_id)
+    if not asset:
+        raise HTTPException(404, "素材不存在")
+    if asset.status != AssetStatus.ready:
+        raise HTTPException(409, "素材尚未处理完成")
+    if asset.media_type not in {"image", "video"}:
+        raise HTTPException(415, "仅图片和视频支持比例导出")
+    try:
+        key, _content_type, filename, cache_hit = export_asset(asset, payload)
+    except (RuntimeError, ValueError) as exc:
+        logger.exception("Unable to export asset %s", asset_id)
+        raise HTTPException(422, str(exc)) from exc
+    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return stream_key(key, {
+        "Content-Disposition": disposition,
+        "X-Export-Cache": "hit" if cache_hit else "miss",
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Export-Cache",
+    })
 
 
 @app.post("/api/assets/{asset_id}/reanalyze", response_model=AssetOut, status_code=202)
@@ -437,14 +551,43 @@ def update_asset(asset_id: str, payload: AssetUpdate, db: Session = Depends(get_
     return serialize(asset)
 
 
+def _remove_asset(asset: Asset, db: Session) -> None:
+    delete_object(asset.object_key)
+    if asset.thumbnail_key:
+        delete_object(asset.thumbnail_key)
+    delete_prefix(f"exports/{asset.id}/")
+    db.delete(asset)
+    db.commit()
+    safe_delete_asset_vector(asset.id)
+
+
+@app.delete("/api/assets/batch", response_model=AssetBatchDeleteResult)
+def remove_assets(payload: AssetBatchDelete, db: Session = Depends(get_db)):
+    asset_ids = list(dict.fromkeys(payload.ids))
+    assets = {
+        asset.id: asset
+        for asset in db.scalars(select(Asset).where(Asset.id.in_(asset_ids))).all()
+    }
+    deleted_ids = []
+    failed = {}
+    for asset_id in asset_ids:
+        asset = assets.get(asset_id)
+        if not asset:
+            failed[asset_id] = "素材不存在"
+            continue
+        try:
+            _remove_asset(asset, db)
+            deleted_ids.append(asset_id)
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Unable to delete asset %s", asset_id)
+            failed[asset_id] = str(exc)[:500] or "删除失败"
+    return AssetBatchDeleteResult(deleted_ids=deleted_ids, failed=failed)
+
+
 @app.delete("/api/assets/{asset_id}", status_code=204)
 def remove_asset(asset_id: str, db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
     if not asset:
         raise HTTPException(404, "素材不存在")
-    delete_object(asset.object_key)
-    if asset.thumbnail_key:
-        delete_object(asset.thumbnail_key)
-    db.delete(asset)
-    db.commit()
-    safe_delete_asset_vector(asset_id)
+    _remove_asset(asset, db)
