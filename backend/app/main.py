@@ -4,28 +4,30 @@ import threading
 import time
 import uuid
 import re
-import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from botocore.exceptions import ClientError
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .database import Base, engine, get_db, migrate_demo_schema
-from .models import Asset, AssetStatus
+from .database import Base, SessionLocal, engine, get_db, migrate_demo_schema
+from .models import Asset, AssetStatus, ImportJob, ImportJobStatus
 from .fred import FredError, generate_chart as generate_fred_chart, list_series as list_fred_series
+from .ibaotu import IbaotuError, search as search_ibaotu
+from .import_jobs import run_ibaotu_import
 from .openverse import OpenverseError, download as download_openverse, get_download as get_openverse_download, search as search_openverse
 from .pexels import PexelsError, download as download_pexels, get_download as get_pexels_download, search as search_pexels
 from .pixabay import PixabayError, download as download_pixabay, get_download as get_pixabay_download, search as search_pixabay
 from .processor import process_asset
 from .media_export import export_asset
-from .mixkit import MixkitError, download as download_mixkit, get_download as get_mixkit_download, search as search_mixkit
+from .mixkit import MixkitError, download as download_mixkit, get_download as get_mixkit_download, get_preview as get_mixkit_preview, search as search_mixkit
 from .schemas import (
     AssetBatchDelete,
     AssetBatchDeleteResult,
@@ -35,12 +37,14 @@ from .schemas import (
     AssetUpdate,
     ExternalAssetImport,
     ExternalAssetList,
+    ExternalAssetPreviewOut,
+    ImportJobOut,
     FredChartCreate,
 )
-from .semantic import expand_from_assets, expand_query
+from .semantic import expand_query_fast
 from .storage import delete_object, delete_prefix, ensure_bucket, get_object, move_object, put_bytes
 from .unsplash import UnsplashError, download as download_unsplash, get_download as get_unsplash_download, search as search_unsplash
-from .vector_store import embed_texts, reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
+from .vector_store import reindex_ready_assets, safe_delete_asset_vector, safe_index_asset, search_assets
 
 
 ALLOWED_TYPES = {
@@ -75,6 +79,20 @@ async def lifespan(_: FastAPI):
             time.sleep(2)
     if last_error:
         raise last_error
+    recovery_db = SessionLocal()
+    try:
+        pending_jobs = recovery_db.scalars(select(ImportJob).where(
+            ImportJob.status.in_((ImportJobStatus.queued, ImportJobStatus.running))
+        )).all()
+        for job in pending_jobs:
+            threading.Thread(
+                target=run_ibaotu_import,
+                args=(job.id,),
+                daemon=True,
+                name=f"import-recovery-{job.id[:8]}",
+            ).start()
+    finally:
+        recovery_db.close()
     threading.Thread(target=reindex_ready_assets, daemon=True, name="vector-index-sync").start()
     yield
 
@@ -199,19 +217,40 @@ async def upload_asset(
 @app.get("/api/external-assets/search", response_model=ExternalAssetList)
 def search_external_assets(
     q: str = Query(min_length=1, max_length=100),
-    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit)$"),
+    provider: str = Query(default="pexels", pattern="^(pexels|pixabay|unsplash|openverse|mixkit|ibaotu)$"),
     media_type: str = Query(default="image", pattern="^(image|video)$"),
     page: int = Query(default=1, ge=1, le=100),
     per_page: int = Query(default=12, ge=1, le=40),
 ):
     try:
-        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
+        searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
         return searchers[provider](q.strip(), media_type, page, per_page)
-    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError) as exc:
+    except (PexelsError, PixabayError, UnsplashError, OpenverseError, MixkitError, IbaotuError) as exc:
         raise HTTPException(503, str(exc)) from exc
 
 
-@app.post("/api/external-assets/import", response_model=AssetOut, status_code=202)
+@app.get("/api/external-assets/preview", response_model=ExternalAssetPreviewOut)
+def external_asset_preview(
+    provider: str = Query(pattern="^mixkit$"),
+    external_id: str = Query(min_length=1, max_length=100),
+    media_type: str = Query(pattern="^video$"),
+):
+    try:
+        preview = get_mixkit_preview(external_id, media_type)
+    except MixkitError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return ExternalAssetPreviewOut(
+        provider=provider,
+        external_id=external_id,
+        media_type=media_type,
+        preview_content_url=preview["url"],
+        mime_type="video/mp4",
+        width=preview.get("width"),
+        height=preview.get("height"),
+    )
+
+
+@app.post("/api/external-assets/import", response_model=AssetOut | ImportJobOut, status_code=202)
 def import_external_asset(
     payload: ExternalAssetImport,
     background_tasks: BackgroundTasks,
@@ -221,8 +260,30 @@ def import_external_asset(
         Asset.source_type == payload.provider,
         Asset.source_id == payload.external_id,
     ))
-    if existing:
+    if existing and payload.provider == "ibaotu" and (existing.source_metadata or {}).get("licensed_media_filename"):
+        if existing.media_type == "video" and not (existing.media_metadata or {}).get("preview_key"):
+            existing.status = AssetStatus.processing
+            db.commit()
+            background_tasks.add_task(process_asset, existing.id)
         return serialize(existing)
+    if existing and (
+        payload.provider != "ibaotu"
+    ):
+        return serialize(existing)
+    if payload.provider == "ibaotu":
+        active = db.scalar(select(ImportJob).where(
+            ImportJob.provider == "ibaotu",
+            ImportJob.external_id == payload.external_id,
+            ImportJob.status.in_((ImportJobStatus.queued, ImportJobStatus.running)),
+        ).order_by(ImportJob.created_at.desc()))
+        if active:
+            return active
+        job = ImportJob(provider="ibaotu", external_id=payload.external_id, media_type=payload.media_type)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        background_tasks.add_task(run_ibaotu_import, job.id)
+        return job
     try:
         providers = {
             "pexels": (get_pexels_download, download_pexels, PexelsError, "Pexels License"),
@@ -251,6 +312,14 @@ def import_external_asset(
     if asset.status == AssetStatus.processing:
         background_tasks.add_task(process_asset, asset.id)
     return serialize(asset)
+
+
+@app.get("/api/external-assets/import-jobs/{job_id}", response_model=ImportJobOut)
+def get_import_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(ImportJob, job_id)
+    if not job:
+        raise HTTPException(404, "导入任务不存在")
+    return job
 
 
 @app.get("/api/fred/series")
@@ -306,23 +375,10 @@ def list_assets(
 
     if q.strip():
         source_query = q.strip()
-        generic_terms = expand_query(source_query)
-        candidate_matches = []
-        for candidate_term in generic_terms:
-            term = f"%{candidate_term}%"
-            candidate_matches.extend([
-                Asset.original_name.like(term), Asset.description.like(term), Asset.scene.like(term),
-                Asset.category.like(term), cast(Asset.categories, String).like(term), cast(Asset.tags, String).like(term),
-            ])
-        candidate_query = select(Asset).where(or_(*candidate_matches), *base_filters).limit(50)
-        candidates = db.scalars(candidate_query).all()
-        corpus = []
-        for asset in candidates:
-            corpus.extend([
-                asset.original_name, asset.description or "", asset.scene or "", asset.category or "",
-                *(asset.categories or []), *(asset.tags or []),
-            ])
-        asset_terms = expand_from_assets(source_query, corpus)
+        generic_terms = expand_query_fast(source_query)
+        # Vector search already supplies semantic recall, so no generative-model
+        # expansion or preliminary candidate query is needed here.
+        asset_terms: list[str] = []
         query_terms = [source_query, *asset_terms]
         search_terms = list(dict.fromkeys([*generic_terms, *asset_terms]))
         semantic_matches = []
@@ -357,8 +413,8 @@ def list_assets(
         }
         assets.sort(key=lambda asset: (combined_scores[asset.id], asset.created_at), reverse=True)
         return AssetList(
-            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:10]],
-            total=min(len(assets), 10),
+            items=[serialize(asset, combined_scores[asset.id]) for asset in assets[:20]],
+            total=min(len(assets), 20),
             query_terms=query_terms,
         )
 
@@ -375,61 +431,114 @@ def _normalized_page_url(url: str) -> str:
     return value.rstrip("/?")
 
 
-def _cosine(left: list[float], right: list[float]) -> float:
-    dot = sum(a * b for a, b in zip(left, right))
-    norm_left = math.sqrt(sum(value * value for value in left))
-    norm_right = math.sqrt(sum(value * value for value in right))
-    return dot / (norm_left * norm_right) if norm_left and norm_right else 0.0
-
-
 @app.get("/api/search")
 def unified_search(
     q: str = Query(min_length=1, max_length=100),
     media_type: str | None = Query(default=None, pattern="^(image|video)$"),
     category: str | None = Query(default=None, max_length=80),
+    source: str = Query(default="all", pattern="^(all|local|external)$"),
     db: Session = Depends(get_db),
 ):
     """Search local assets and external providers without importing external files."""
-    local = list_assets(q=q, media_type=media_type, category=category, db=db)
-    local_items = [{"source": "local", "asset": item, "score": item.search_score or 0.0} for item in local.items[:10]]
-    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit}
+    searchers = {"pexels": search_pexels, "pixabay": search_pixabay, "unsplash": search_unsplash, "openverse": search_openverse, "mixkit": search_mixkit, "ibaotu": search_ibaotu}
+    provider_media = {
+        "pexels": {"image", "video"},
+        "pixabay": {"image", "video"},
+        "unsplash": {"image"},
+        "openverse": {"image"},
+        "mixkit": {"video"},
+        "ibaotu": {"image", "video"},
+    }
+    # External image priority is provider-first. Keep each provider's native
+    # ranking, with licensed Baotu results shown before the other platforms.
+    provider_order = {
+        "ibaotu": 0,
+        "pexels": 1,
+        "pixabay": 2,
+        "unsplash": 3,
+        "openverse": 4,
+        "mixkit": 5,
+    }
     requested_types = [media_type] if media_type else ["image", "video"]
+    started_at = time.perf_counter()
+    local_groups = {"image": [], "video": []}
+    query_terms = [q]
+    if source != "external":
+        for requested_type in requested_types:
+            local = list_assets(q=q, media_type=requested_type, category=category, db=db)
+            local_groups[requested_type] = [
+                {"source": "local", "asset": item, "score": item.search_score or 0.0}
+                for item in local.items[:20]
+            ]
+            query_terms.extend(local.query_terms)
+    local_elapsed = time.perf_counter() - started_at
+
     external: list[dict] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(searcher, q.strip(), requested_type, 1, 10): (provider, requested_type)
-            for provider, searcher in searchers.items()
-            for requested_type in requested_types
-        }
-        for future in as_completed(futures):
-            provider, _requested_type = futures[future]
-            try:
-                result = future.result()
-            except Exception:
-                logger.warning("External search failed for %s", provider, exc_info=True)
-                continue
-            for rank, item in enumerate(result.get("items", []), start=1):
-                item = {**item, "provider_rank": rank}
-                item["source"] = "external"
-                external.append(item)
+    if source != "local":
+        with ThreadPoolExecutor(max_workers=len(searchers) * len(requested_types)) as pool:
+            futures = {
+                pool.submit(searcher, q.strip(), requested_type, 1, 20): (provider, requested_type)
+                for provider, searcher in searchers.items()
+                for requested_type in requested_types
+                if requested_type in provider_media[provider]
+            }
+            for future in as_completed(futures):
+                provider, _requested_type = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.warning("External search failed for %s", provider, exc_info=True)
+                    continue
+                for rank, item in enumerate(result.get("items", []), start=1):
+                    item = {**item, "provider_rank": rank}
+                    item["source"] = "external"
+                    external.append(item)
     external = list({(_normalized_page_url(item.get("source_page_url", "")) or f"{item['provider']}:{item['external_id']}"): item for item in external}.values())
-    try:
-        query_vector = embed_texts([q], query=True)[0]
-        texts = [" ".join(str(item.get(key) or "") for key in ("title", "author", "media_type")) for item in external]
-        vectors = embed_texts(texts)
-        for item, vector in zip(external, vectors, strict=True):
-            semantic_score = max(0.0, min(1.0, _cosine(query_vector, vector)))
-            rank_score = 1.0 - ((item["provider_rank"] - 1) / 9)
-            item["score"] = round(0.85 * semantic_score + 0.15 * rank_score, 6)
-    except Exception:
-        logger.warning("External embedding unavailable; using provider rank", exc_info=True)
-        for item in external:
-            item["score"] = round(1.0 - ((item["provider_rank"] - 1) / 9), 6)
-    external_items = [{"provider": item.pop("provider", None), **item} for item in external]
-    external_items.sort(key=lambda item: item["score"], reverse=True)
-    results = local_items + external_items[:20]
-    results.sort(key=lambda item: item["score"], reverse=True)
-    return {"items": results[:30], "total": min(len(results), 30), "query": q, "media_type": media_type}
+    external_images = [item for item in external if item.get("media_type") == "image"]
+    external_image_items = []
+    for provider in provider_order:
+        provider_images = [
+            item for item in external_images
+            if item.get("provider") == provider
+        ]
+        # The score is only the provider's original rank; no cross-provider
+        # semantic/vector re-ranking is performed for external results.
+        for item in provider_images[:20]:
+            item["score"] = round(max(0.0, 1.0 - ((item["provider_rank"] - 1) / 19)), 6)
+            external_image_items.append({"source": "external", **item})
+
+    external_video_items = []
+    for provider in searchers:
+        provider_videos = [
+            item for item in external
+            if item.get("media_type") == "video" and item.get("provider") == provider
+        ]
+        for item in provider_videos[:10]:
+            rank_score = max(0.0, 1.0 - ((item["provider_rank"] - 1) / 9))
+            external_video_items.append({"source": "external", **item, "score": round(rank_score, 6)})
+
+    groups = {
+        "image": {"local": local_groups["image"], "external": external_image_items},
+        "video": {"local": local_groups["video"], "external": external_video_items},
+    }
+    results = [
+        *groups["image"]["local"], *groups["image"]["external"],
+        *groups["video"]["local"], *groups["video"]["external"],
+    ]
+    logger.info(
+        "search timing query=%r source=%s local_ms=%d external_ms=%d total_ms=%d results=%d",
+        q, source, local_elapsed * 1000,
+        (time.perf_counter() - started_at - local_elapsed) * 1000,
+        (time.perf_counter() - started_at) * 1000, len(results),
+    )
+    return {
+        "items": results,
+        "groups": groups,
+        "total": len(results),
+        "query": q,
+        "query_terms": list(dict.fromkeys(query_terms)),
+        "media_type": media_type,
+    }
 
 
 @app.get("/api/assets/{asset_id}", response_model=AssetOut)
@@ -440,21 +549,36 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
     return serialize(asset)
 
 
-def stream_key(key: str, headers: dict[str, str] | None = None):
-    response = get_object(key)
+def stream_key(key: str, headers: dict[str, str] | None = None, range_header: str | None = None):
+    try:
+        response = get_object(key, range_header)
+    except ClientError as exc:
+        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 416:
+            raise HTTPException(416, "请求的视频范围无效") from exc
+        raise
+    response_headers = {
+        **(headers or {}),
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(response.get("ContentLength", 0)),
+    }
+    if response.get("ContentRange"):
+        response_headers["Content-Range"] = response["ContentRange"]
     return StreamingResponse(
         response["Body"].iter_chunks(),
         media_type=response.get("ContentType", "application/octet-stream"),
-        headers=headers,
+        headers=response_headers,
+        status_code=206 if response.get("ContentRange") else 200,
     )
 
 
 @app.get("/api/assets/{asset_id}/content")
-def asset_content(asset_id: str, db: Session = Depends(get_db)):
+def asset_content(asset_id: str, range_header: str | None = Header(default=None, alias="Range"), db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
     if not asset:
         raise HTTPException(404, "素材不存在")
-    return stream_key(asset.object_key)
+    metadata = asset.media_metadata or {}
+    preview_key = metadata.get("preview_key") if asset.media_type == "video" else None
+    return stream_key(preview_key or asset.object_key, range_header=range_header)
 
 
 @app.get("/api/assets/{asset_id}/thumbnail")
@@ -555,6 +679,12 @@ def _remove_asset(asset: Asset, db: Session) -> None:
     delete_object(asset.object_key)
     if asset.thumbnail_key:
         delete_object(asset.thumbnail_key)
+    preview_key = (asset.media_metadata or {}).get("preview_key")
+    if preview_key:
+        delete_object(preview_key)
+    source_metadata = asset.source_metadata or {}
+    if source_metadata.get("source_file_key"):
+        delete_object(source_metadata["source_file_key"])
     delete_prefix(f"exports/{asset.id}/")
     db.delete(asset)
     db.commit()

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     unsplash_access_key: str = ""
     unsplash_api_base_url: str = "https://api.unsplash.com"
     openverse_api_base_url: str = "https://api.openverse.org/v1"
+    ibaotu_id_token: str = ""
+    ibaotu_max_download_mb: int = 1024
     fred_api_key: str = ""
     fred_api_base_url: str = "https://api.stlouisfed.org/fred"
     asr_model_size: str = "base"

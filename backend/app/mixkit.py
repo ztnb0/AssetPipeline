@@ -67,6 +67,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
             "media_type": "video",
             "title": _text(card, ".item-grid-video-player__overlay-video-title::text") or f"Mixkit 视频 {external_id}",
             "preview_url": preview_url,
+            "preview_content_url": None,
             "author": "Mixkit",
             "source_page_url": f"{BASE_URL}{detail_path}",
             "width": int(width) if width and width.isdigit() else None,
@@ -82,7 +83,7 @@ def search(query: str, media_type: str, page: int, per_page: int) -> dict:
     }
 
 
-def get_download(external_id: str, media_type: str) -> dict:
+def _resolve_video(external_id: str, media_type: str, max_dimension: int) -> dict:
     numeric_id, separator, detail_slug = external_id.partition(":")
     if media_type != "video" or not separator or not numeric_id.isdigit() or not re.fullmatch(r"[a-z0-9-]+", detail_slug):
         raise MixkitError("Mixkit 素材 ID 或类型无效")
@@ -98,7 +99,7 @@ def get_download(external_id: str, media_type: str) -> dict:
             options.append((int(match.group(1)), int(match.group(2)), label, value))
     if not options:
         raise MixkitError("该 Mixkit 视频没有可导入的下载规格")
-    eligible = [item for item in options if max(item[0], item[1]) <= 1920] or options
+    eligible = [item for item in options if max(item[0], item[1]) <= max_dimension] or options
     width, height, label, download_path = max(eligible, key=lambda item: item[0] * item[1])
     download_page = _page(f"{BASE_URL}{download_path}")
     download_url = download_page.css(
@@ -108,17 +109,33 @@ def get_download(external_id: str, media_type: str) -> dict:
         raise MixkitError("Mixkit 没有返回可导入的视频地址")
     return {
         "url": download_url,
+        "width": width,
+        "height": height,
+        "label": label,
+        "page_url": detail_url,
+    }
+
+
+def get_preview(external_id: str, media_type: str) -> dict:
+    return _resolve_video(external_id, media_type, 1280)
+
+
+def get_download(external_id: str, media_type: str) -> dict:
+    preview = _resolve_video(external_id, media_type, 1920)
+    numeric_id = external_id.partition(":")[0]
+    return {
+        "url": preview["url"],
         "filename": f"mixkit-{numeric_id}.mp4",
         "mime_type": "video/mp4",
-        "page_url": detail_url,
+        "page_url": preview["page_url"],
         "author": "Mixkit",
         "license": LICENSE_NAME,
         "metadata": {
             "provider": "mixkit",
             "external_id": numeric_id,
             "license_url": LICENSE_URL,
-            "selected_resolution": f"{width}x{height}",
-            "selected_label": label,
+            "selected_resolution": f"{preview['width']}x{preview['height']}",
+            "selected_label": preview["label"],
         },
     }
 
